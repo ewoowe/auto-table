@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+    "auto-table-core",
+    "auto-table-derive",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+readme = "README.md"
+description = "基于 SeaORM 的自动建表工具：通过属性宏在编译期收集实体，启动时自动创建数据库表"
+keywords = ["sea-orm", "database", "table", "proc-macro", "orm"]
+categories = ["database", "development-tools::procedural-macro-helpers"]
+
+[workspace.dependencies]
+sea-orm = { version = "2.0.0", features = ["sqlx-mysql", "runtime-tokio-rustls", "macros"] }
+inventory = "0.3"
+thiserror = "1"
+syn = { version = "3.0.3", features = ["full"] }
+quote = "1"
+auto-table-derive = { path = "auto-table-derive", version = "0.1.0" }

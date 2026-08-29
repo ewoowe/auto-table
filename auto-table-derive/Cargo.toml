@@ -1,0 +1,16 @@
+[package]
+name = "auto-table-derive"
+description = "auto-table 的过程宏实现"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn.workspace = true
+quote.workspace = true

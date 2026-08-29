@@ -1,0 +1,16 @@
+# Rust 构建产物
+/target
+
+# 库项目不提交 Cargo.lock（若后续加入 bin/examples 可再放开）
+Cargo.lock
+
+# IDE 与编辑器
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# AI 助手工作产物（含跨会话记忆）
+.codebuddy/
+
+
