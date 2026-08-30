@@ -1,6 +1,6 @@
 [package]
 name = "auto-table-derive"
-description = "auto-table 的过程宏实现"
+description = "Procedural macro implementation of auto-table"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

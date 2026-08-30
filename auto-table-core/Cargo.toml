@@ -1,6 +1,6 @@
 [package]
 name = "auto-table-core"
-description = "auto-table 的核心库：提供 #[auto_table] / #[auto_create] 宏的运行时支持与错误类型"
+description = "Core library of auto-table: runtime support and error types for the #[auto_table] / #[auto_create] macros"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

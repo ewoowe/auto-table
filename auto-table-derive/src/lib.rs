@@ -2,14 +2,17 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{parse_macro_input, ItemFn, ItemStruct};
 
-// 注意：proc-macro crate 不能直接 re-export 普通库
-// 用户需要同时依赖 auto_table_core 和 auto_table_derive
+// Note: a proc-macro crate cannot directly re-export ordinary library items,
+// so the procedural macros are re-exported through `auto_table_core`
+// (`pub use auto_table_derive::{auto_create, auto_table};`).
+// Users only need to depend on `auto_table_core`.
 
-/// 自动建表属性宏
+/// Attribute macro for automatic table creation
 ///
-/// 用在 SeaORM Entity 的 Model 结构体上，自动生成 inventory 注册代码
+/// Apply it to the `Model` struct of a SeaORM Entity; it generates the
+/// inventory registration code automatically.
 ///
-/// # 示例
+/// # Example
 /// ```ignore
 /// #[auto_table]
 /// #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
@@ -21,16 +24,16 @@ use syn::{parse_macro_input, ItemFn, ItemStruct};
 #[proc_macro_attribute]
 pub fn auto_table(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemStruct);
-    
-    // 保留原始结构体定义
+
+    // Keep the original struct definition
     let original = &input;
-    
-    // 生成 inventory 注册代码
+
+    // Generate the inventory registration code
     let expanded = quote! {
         #original
-        
-        // 自动生成 inventory 注册
-        // 使用 auto_table_core 中定义的 TableRegistration
+
+        // Auto-generated inventory registration
+        // Uses the TableRegistration type defined in auto_table_core
         inventory::submit! {
             auto_table_core::TableRegistration {
                 create_fn: |backend| {
@@ -40,84 +43,92 @@ pub fn auto_table(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
     };
-    
+
     expanded.into()
 }
 
-/// 自动建表注入属性宏
+/// Attribute macro that injects automatic table creation
 ///
-/// 用在包含数据库初始化的函数上，自动在函数体倒数第二条语句前注入建表逻辑。
-/// 参数为函数体中 `DatabaseConnection` 变量的名称。
-/// 这样最后两条语句（如 `DB.set(db)` 和 `Ok(())`）保持在注入点之后，
-/// 避免了 move 和 borrow 的冲突。
+/// Apply it to a function that initializes the database. The argument is the
+/// name of the `DatabaseConnection` variable in the function body. The macro
+/// locates the `let <db> = ...` binding and injects the table-creation call
+/// immediately after it, so the call runs right after the connection is
+/// established and before `db` is moved. This does not depend on how many
+/// trailing statements the function body has.
 ///
-/// # 示例
+/// # Example
 /// ```ignore
 /// #[auto_create(db)]
 /// pub async fn init_pool(database_url: &str) -> anyhow::Result<()> {
 ///     let db = Database::connect(database_url).await?;
 ///     db.ping().await?;
-///     DB.set(db).expect("...");  // 最后两条语句之一，在注入点之后
+///     DB.set(db).expect("...");
 ///     Ok(())
 /// }
 /// ```
 ///
-/// 等价于手动编写：
+/// Equivalent to writing manually:
 /// ```ignore
 /// pub async fn init_pool(database_url: &str) -> anyhow::Result<()> {
 ///     let db = Database::connect(database_url).await?;
+///     let __auto_table_report = create_tables(&db).await?;  // injection point
 ///     db.ping().await?;
-///     create_tables(&db).await?;  // 注入点：倒数第二条语句前
-///     DB.set(db).expect(...);     // db 在这里才被 move
+///     DB.set(db).expect(...);     // db is only moved here
 ///     Ok(())
 /// }
 ///
-/// async fn create_tables(db: &sea_orm::DatabaseConnection) -> Result<(), sea_orm::DbErr> {
-///     let backend = db.get_database_backend();
-///     let statements = auto_table_core::get_all_table_statements(backend);
-///     let existing_tables = auto_table_core::get_existing_tables(db, backend).await?;
-///
-///     for mut stmt in statements {
-///         let table_name = auto_table_core::get_table_name(&stmt);
-///         if let Some(ref name) = table_name {
-///             if existing_tables.contains(name) {
-///                 rolling_logger::info!("表 `{}` 已存在，跳过建表", name);
-///                 continue;
-///             }
-///         }
-///         stmt.if_not_exists();
-///         db.execute(&stmt).await?;
-///     }
-///     Ok(())
+/// async fn create_tables(
+///     db: &sea_orm::DatabaseConnection,
+/// ) -> Result<auto_table_core::TableCreationReport, auto_table_core::TableError> {
+///     auto_table_core::create_missing_tables(db).await
 /// }
 /// ```
+///
+/// The table-creation logic is implemented in
+/// [`auto_table_core::create_missing_tables`], which performs no logging and
+/// instead returns a [`auto_table_core::TableCreationReport`] describing which
+/// tables already existed and which were created.
+///
+/// The injected statement binds that report to a fixed local variable named
+/// `__auto_table_report` (of type `auto_table_core::TableCreationReport`),
+/// which is in scope for the statements that follow the injection point (i.e.
+/// the rest of the function body). Its name starts with an underscore, so it
+/// does not trigger an unused-variable warning if you do not consume it.
+///
+/// If no `let <db> = ...` binding is found (e.g. `db` is a function
+/// parameter), the call is injected at the very beginning of the function body.
 #[proc_macro_attribute]
 pub fn auto_create(attr: TokenStream, item: TokenStream) -> TokenStream {
     let db_var = parse_macro_input!(attr as syn::Ident);
     let mut input = parse_macro_input!(item as ItemFn);
 
     let fn_name = &input.sig.ident;
+    // Prefix the generated helper function name to avoid collisions
     let create_tables_fn = format_ident!("__auto_create_tables_{}", fn_name);
 
-    // 在函数体倒数数第二条表达式前注入 create_tables 调用
-    // 这样最后两条语句（如 DB.set(db) 和 Ok(())）保持在注入点之后
-    let stmts = &input.block.stmts;
-    let len = stmts.len();
-
     let call_stmt: syn::Stmt = syn::parse_quote! {
-        #create_tables_fn(&#db_var).await?;
+        let __auto_table_report = #create_tables_fn(&#db_var).await?;
     };
 
-    // 取除最后两条之外的所有语句，给某些特殊操作留位置
-    let mut new_stmts: Vec<syn::Stmt> = stmts.iter().take(len.saturating_sub(2)).cloned().collect();
-    // 注入建表调用
-    new_stmts.push(call_stmt);
-    // 追加最后两条语句（保持原有顺序）
-    if len >= 2 {
-        new_stmts.push(stmts[len - 2].clone());
+    // Inject the call right after the `let <db_var> = ...` binding, instead of
+    // guessing a fixed number of trailing statements. The report is then in
+    // scope for the rest of the function body.
+    let stmts = &input.block.stmts;
+    let mut new_stmts: Vec<syn::Stmt> = Vec::with_capacity(stmts.len() + 1);
+
+    let mut inserted = false;
+    for stmt in stmts.iter() {
+        new_stmts.push(stmt.clone());
+        if !inserted && is_db_binding(stmt, &db_var) {
+            new_stmts.push(call_stmt.clone());
+            inserted = true;
+        }
     }
-    if let Some(last) = stmts.last() {
-        new_stmts.push(last.clone());
+
+    // Fallback: no `let <db_var> = ...` binding found (e.g. `db` is a function
+    // parameter). Inject at the very beginning of the body.
+    if !inserted {
+        new_stmts.insert(0, call_stmt);
     }
 
     input.block.stmts = new_stmts;
@@ -125,50 +136,31 @@ pub fn auto_create(attr: TokenStream, item: TokenStream) -> TokenStream {
     let expanded = quote! {
         #input
 
-        /// 自动生成的建表函数
+        /// Auto-generated table-creation function
         ///
-        /// 返回库层精确错误 `auto_table_core::TableError`，
-        /// 由调用方（应用层）经 `?` 装箱为 anyhow 错误传播。
-        async fn #create_tables_fn(db: &sea_orm::DatabaseConnection) -> Result<(), auto_table_core::TableError> {
-            use sea_orm::ConnectionTrait;
-
-            let backend = db.get_database_backend();
-            let statements = auto_table_core::get_all_table_statements(backend);
-
-            // 查询数据库中已存在的表
-            let existing_tables = auto_table_core::get_existing_tables(db, backend).await?;
-            if !existing_tables.is_empty() {
-                rolling_logger::info!("数据库中已存在的表: {:?}", existing_tables);
-            }
-
-            let mut created_count = 0;
-            let mut skipped_count = 0;
-
-            for mut stmt in statements {
-                let table_name = auto_table_core::get_table_name(&stmt);
-                if let Some(ref name) = table_name {
-                    if existing_tables.contains(name) {
-                        rolling_logger::info!("表 `{}` 已存在，跳过建表", name);
-                        skipped_count += 1;
-                        continue;
-                    }
-                }
-
-                stmt.if_not_exists();
-                db.execute(&stmt)
-                    .await
-                    .map_err(|source| auto_table_core::TableError::CreateFailed {
-                        table: auto_table_core::get_table_name(&stmt)
-                            .unwrap_or_else(|| "unknown".to_string()),
-                        source,
-                    })?;
-                created_count += 1;
-            }
-
-            rolling_logger::info!("数据库表自动创建完成，新建 {} 张，跳过 {} 张", created_count, skipped_count);
-            Ok(())
+        /// Delegates to `auto_table_core::create_missing_tables`, returning a
+        /// `auto_table_core::TableCreationReport` (the tables that already
+        /// existed and the tables created in this run). Failures are reported
+        /// as the precise library-level error `auto_table_core::TableError`,
+        /// which the caller (application layer) can box into an anyhow error via `?`.
+        async fn #create_tables_fn(db: &sea_orm::DatabaseConnection) -> Result<auto_table_core::TableCreationReport, auto_table_core::TableError> {
+            auto_table_core::create_missing_tables(db).await
         }
     };
 
     expanded.into()
+}
+
+/// Returns `true` if `stmt` is a `let` binding whose pattern binds exactly the
+/// identifier `var` (either directly as `let var = ...` or with a type
+/// annotation as `let var: Type = ...`).
+fn is_db_binding(stmt: &syn::Stmt, var: &syn::Ident) -> bool {
+    let syn::Stmt::Local(local) = stmt else {
+        return false;
+    };
+    match &local.pat {
+        syn::Pat::Ident(pat) => pat.ident == *var,
+        syn::Pat::Type(pat) => matches!(&*pat.pat, syn::Pat::Ident(inner) if inner.ident == *var),
+        _ => false,
+    }
 }

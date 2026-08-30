@@ -1,30 +1,32 @@
 # auto-table
 
-基于 [SeaORM](https://crates.io/crates/sea-orm) 的自动建表工具库。通过属性宏在编译期收集所有实体，并在应用启动时自动创建数据库中缺失的表。
+[English](README.md) | [中文文档](README.zh-CN.md)
 
-## 组成
+An automatic table-creation toolkit built on [SeaORM](https://crates.io/crates/sea-orm). It collects all entities at compile time via attribute macros and automatically creates missing tables in the database at application startup.
 
-本 workspace 包含两个 crate：
+## Crates
 
-| Crate | 说明 |
+This workspace contains two crates:
+
+| Crate | Description |
 | --- | --- |
-| [`auto-table-core`](auto-table-core) | 核心库，提供 `#[auto_table]` / `#[auto_create]` 宏的运行时支持与错误类型 |
-| [`auto-table-derive`](auto-table-derive) | 过程宏实现（proc-macro） |
+| [`auto-table-core`](auto-table-core) | Core library: runtime support and error types for the `#[auto_table]` / `#[auto_create]` macros |
+| [`auto-table-derive`](auto-table-derive) | Procedural macro implementation |
 
-> 通常你只需依赖 `auto-table-core`，它已通过 `pub use` 重新导出了两个过程宏。
+> In most cases you only need to depend on `auto-table-core`; it re-exports both procedural macros via `pub use`.
 
-## 使用
+## Usage
 
-在 `Cargo.toml` 中添加依赖：
+Add the dependency to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-auto-table-core = "0.1.0"
+auto-table-core = "0.3.0"
 ```
 
-### 1. 标记实体
+### 1. Mark an entity
 
-在 SeaORM Entity 的 `Model` 结构体上使用 `#[auto_table]`：
+Apply `#[auto_table]` to the `Model` struct of a SeaORM Entity:
 
 ```rust
 use sea_orm::entity::prelude::*;
@@ -44,9 +46,9 @@ pub enum Relation {}
 impl ActiveModelBehavior for ActiveModel {}
 ```
 
-### 2. 注入建表逻辑
+### 2. Inject table-creation logic
 
-在数据库初始化函数上使用 `#[auto_create(db)]`，其中 `db` 是函数体内 `DatabaseConnection` 变量的名称：
+Apply `#[auto_create(db)]` to the function that initializes the database, where `db` is the name of the `DatabaseConnection` variable inside the function body:
 
 ```rust
 #[auto_create(db)]
@@ -58,17 +60,19 @@ pub async fn init_pool(database_url: &str) -> anyhow::Result<()> {
 }
 ```
 
-宏会在函数体倒数第二条语句前注入建表逻辑，保证最后两条语句（如 `DB.set(db)` 与 `Ok(())`）在 `db` 被 move 之后仍然顺序正确。
+The macro locates the `let db = ...` binding in the function body and injects the table-creation logic immediately after it, so the logic runs right after the connection is established and before `db` is moved. This does not depend on how many trailing statements the function body has.
 
-## 支持的后端
+The injected logic performs no logging. Instead, the generated table-creation function returns an [`auto_table_core::TableCreationReport`](auto-table-core/src/lib.rs), which contains `existing_tables` (tables that already existed and were skipped) and `created_tables` (tables created in this run). The injected statement binds this report to a local variable named `__auto_table_report`, which is in scope for the rest of the function body, so you can log or act on the result there. The name starts with an underscore, so leaving it unused does not trigger a warning. You can also call [`auto_table_core::create_missing_tables`](auto-table-core/src/lib.rs) directly if you need the report outside the macro.
+
+## Supported backends
 
 - MySQL
 - PostgreSQL
 - SQLite
 
-## 错误处理
+## Error handling
 
-核心库通过 `thiserror` 暴露精确的 [`auto_table_core::TableError`](auto-table-core/src/lib.rs)，上层应用可经 `?` 自动装箱为 `anyhow::Error` 传播。
+The core library exposes a precise [`auto_table_core::TableError`](auto-table-core/src/lib.rs) via `thiserror`; upper-layer applications can propagate it automatically as `anyhow::Error` through `?`.
 
 ## License
 
