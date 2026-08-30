@@ -81,7 +81,7 @@ pub fn auto_table(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///         let table_name = auto_table_core::get_table_name(&stmt);
 ///         if let Some(ref name) = table_name {
 ///             if existing_tables.contains(name) {
-///                 tracing::info!("表 `{}` 已存在，跳过建表", name);
+///                 rolling_logger::info!("表 `{}` 已存在，跳过建表", name);
 ///                 continue;
 ///             }
 ///         }
@@ -138,7 +138,7 @@ pub fn auto_create(attr: TokenStream, item: TokenStream) -> TokenStream {
             // 查询数据库中已存在的表
             let existing_tables = auto_table_core::get_existing_tables(db, backend).await?;
             if !existing_tables.is_empty() {
-                tracing::info!("数据库中已存在的表: {:?}", existing_tables);
+                rolling_logger::info!("数据库中已存在的表: {:?}", existing_tables);
             }
 
             let mut created_count = 0;
@@ -148,7 +148,7 @@ pub fn auto_create(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let table_name = auto_table_core::get_table_name(&stmt);
                 if let Some(ref name) = table_name {
                     if existing_tables.contains(name) {
-                        tracing::info!("表 `{}` 已存在，跳过建表", name);
+                        rolling_logger::info!("表 `{}` 已存在，跳过建表", name);
                         skipped_count += 1;
                         continue;
                     }
@@ -165,7 +165,7 @@ pub fn auto_create(attr: TokenStream, item: TokenStream) -> TokenStream {
                 created_count += 1;
             }
 
-            tracing::info!("数据库表自动创建完成，新建 {} 张，跳过 {} 张", created_count, skipped_count);
+            rolling_logger::info!("数据库表自动创建完成，新建 {} 张，跳过 {} 张", created_count, skipped_count);
             Ok(())
         }
     };

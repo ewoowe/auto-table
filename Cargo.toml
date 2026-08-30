@@ -6,7 +6,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 readme = "README.md"
@@ -20,4 +20,4 @@ inventory = "0.3"
 thiserror = "1"
 syn = { version = "3.0.3", features = ["full"] }
 quote = "1"
-auto-table-derive = { path = "auto-table-derive", version = "0.1.0" }
+auto-table-derive = { path = "auto-table-derive", version = "0.2.0" }
