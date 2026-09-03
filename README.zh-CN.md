@@ -74,6 +74,16 @@ pub async fn init_pool(database_url: &str) -> anyhow::Result<()> {
 
 核心库通过 `thiserror` 暴露精确的 [`auto_table_core::TableError`](auto-table-core/src/lib.rs)，上层应用可经 `?` 自动装箱为 `anyhow::Error` 传播。
 
+## 路线图
+
+- [ ] **数据库迁移（migration）** — 目前只会创建缺失的表，不会对已存在的表做结构变更。计划支持：
+  - 对比实体定义与线上表结构，自动生成 `ALTER TABLE` 语句
+  - 新增/删除列，修改列类型与约束，索引与唯一约束变更
+  - dry-run 预览迁移 SQL，确认后再执行
+  - 迁移版本记录表，保证同一迁移只执行一次
+- [ ] 迁移回滚（down migration）
+- [ ] 更细粒度的后端特性开关（按需启用 MySQL / PostgreSQL / SQLite）
+
 ## License
 
 MIT

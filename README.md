@@ -74,6 +74,16 @@ The injected logic performs no logging. Instead, the generated table-creation fu
 
 The core library exposes a precise [`auto_table_core::TableError`](auto-table-core/src/lib.rs) via `thiserror`; upper-layer applications can propagate it automatically as `anyhow::Error` through `?`.
 
+## Roadmap
+
+- [ ] **Database migrations** — currently the library only creates missing tables and never alters existing ones. Planned:
+  - Diff entity definitions against live table schemas and generate `ALTER TABLE` statements automatically
+  - Add/drop columns, change column types and constraints, manage indexes and unique constraints
+  - Dry-run mode to preview the migration SQL before executing it
+  - A migration bookkeeping table so each migration runs only once
+- [ ] Rollback (down migration) support
+- [ ] Finer-grained backend feature flags (opt-in MySQL / PostgreSQL / SQLite)
+
 ## License
 
 MIT
