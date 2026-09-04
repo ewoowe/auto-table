@@ -2,7 +2,7 @@
 
 [English](README.md) | [中文文档](README.zh-CN.md)
 
-基于 [SeaORM](https://crates.io/crates/sea-orm) 的自动建表工具库。通过属性宏在编译期收集所有实体，并在应用启动时自动创建数据库中缺失的表。
+基于 [SeaORM](https://crates.io/crates/sea-orm) 的建表与迁移工具库。通过属性宏在编译期收集所有实体，在应用启动时自动创建缺失的表，并可将已存在的表结构与实体定义对齐（支持 MySQL 与 SQLite）。
 
 ## 组成
 
@@ -10,7 +10,7 @@
 
 | Crate | 说明 |
 | --- | --- |
-| [`auto-table-core`](auto-table-core) | 核心库，提供 `#[auto_table]` / `#[auto_create]` 宏的运行时支持与错误类型 |
+| [`auto-table-core`](auto-table-core) | 核心库，提供 `#[auto_table]` / `#[auto_create]` 宏的运行时支持、表结构读取与比对、迁移计划与执行 |
 | [`auto-table-derive`](auto-table-derive) | 过程宏实现（proc-macro） |
 
 > 通常你只需依赖 `auto-table-core`，它已通过 `pub use` 重新导出了两个过程宏。
@@ -78,7 +78,7 @@ auto-table-core = { version = "0.3.0", default-features = false, features = ["my
 
 可用特性：`mysql`、`postgres`、`sqlite`。三者是叠加的，可同时启用；**至少需启用一个**，否则编译期直接报错。
 
-> 特性只决定编译进哪些**数据库驱动**。后端在运行时由 `DbBackend` 判别，因此查询已有表等逻辑对三个后端始终可用。
+> 特性只决定编译进哪些**数据库驱动**。后端在运行时由 `DbBackend` 判别，因此查询已有表等逻辑对三个后端都会被编译进来；但要真正连上某个后端，仍需启用对应的驱动。
 
 ### 4. 迁移已存在的表
 
@@ -98,6 +98,13 @@ auto_table_core::apply_migrations(&db, &plan).await?;
 迁移是**声明式**的：每次都拿实体定义与数据库当前结构做 diff，而非按版本号依次执行。因此它是幂等的——执行完再生成一次计划必然为空；中途失败也可在修复数据后重跑，已完成的变更不会重复。
 
 目前支持 MySQL 与 SQLite。PostgreSQL 尚不支持——它的 ALTER 语法把一个列变更拆成多条子句，需要单独的生成器。
+
+若需要更细粒度的控制，也可以直接使用这些构件自行组装：
+
+- [`get_table_schema`](auto-table-core/src/schema.rs) —— 读取某张表当前的结构
+- [`parse_create_table`](auto-table-core/src/parse.rs) —— 把实体生成的 `CREATE TABLE` 解析成同样的结构
+- [`diff_table`](auto-table-core/src/diff.rs) —— 比对两份结构，得到变更清单
+- [`plan_table_migration`](auto-table-core/src/migrate.rs) —— 把单张表的变更清单变成语句（MySQL 与 SQLite 均适用）
 
 #### 迁移对已有数据的影响
 

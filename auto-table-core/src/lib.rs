@@ -30,7 +30,8 @@ pub use diff::{
     diff_table, ColumnAspect, ColumnChange, IndexChange, TableDiff,
 };
 pub use migrate::{
-    apply_migrations, plan_migrations, plan_table_statements, MigrationPlan, TableMigration,
+    apply_migrations, plan_migrations, plan_table_migration, plan_table_statements, MigrationPlan,
+    TableMigration,
 };
 pub use parse::{parse_create_table, ParseError, PRIMARY_INDEX_NAME};
 pub use schema::{get_table_schema, ColumnSchema, IndexSchema, TableSchema};

@@ -2,7 +2,7 @@
 
 [English](README.md) | [中文文档](README.zh-CN.md)
 
-An automatic table-creation toolkit built on [SeaORM](https://crates.io/crates/sea-orm). It collects all entities at compile time via attribute macros and automatically creates missing tables in the database at application startup.
+A table-creation and migration toolkit built on [SeaORM](https://crates.io/crates/sea-orm). It collects all entities at compile time via attribute macros, creates missing tables at application startup, and can bring existing tables back in line with the entity definitions (MySQL and SQLite).
 
 ## Crates
 
@@ -10,7 +10,7 @@ This workspace contains two crates:
 
 | Crate | Description |
 | --- | --- |
-| [`auto-table-core`](auto-table-core) | Core library: runtime support and error types for the `#[auto_table]` / `#[auto_create]` macros |
+| [`auto-table-core`](auto-table-core) | Core library: runtime support for the `#[auto_table]` / `#[auto_create]` macros, schema reading and diffing, migration planning and execution |
 | [`auto-table-derive`](auto-table-derive) | Procedural macro implementation |
 
 > In most cases you only need to depend on `auto-table-core`; it re-exports both procedural macros via `pub use`.
@@ -78,7 +78,7 @@ auto-table-core = { version = "0.3.0", default-features = false, features = ["my
 
 Available features: `mysql`, `postgres`, `sqlite`. They are additive, so several can be enabled at once; **at least one is required**, otherwise compilation fails immediately.
 
-> The features only decide which **database drivers** get compiled. The backend is determined at runtime by `DbBackend`, so logic such as querying existing tables works for all three backends regardless.
+> The features only decide which **database drivers** get compiled. The backend is determined at runtime by `DbBackend`, so logic such as querying existing tables is compiled in for all three; connecting to a given backend still requires its driver.
 
 ### 4. Migrating tables that already exist
 
@@ -104,6 +104,13 @@ changes are not repeated.
 
 MySQL and SQLite are supported. PostgreSQL is not: its ALTER syntax splits a
 column change into several clauses, which needs a generator of its own.
+
+For finer-grained control the building blocks are public as well:
+
+- [`get_table_schema`](auto-table-core/src/schema.rs) — read the current structure of a table
+- [`parse_create_table`](auto-table-core/src/parse.rs) — parse the entity's `CREATE TABLE` into the same structure
+- [`diff_table`](auto-table-core/src/diff.rs) — compare two structures and get the list of changes
+- [`plan_table_migration`](auto-table-core/src/migrate.rs) — turn the changes of one table into statements (MySQL and SQLite)
 
 #### What happens to existing rows
 
