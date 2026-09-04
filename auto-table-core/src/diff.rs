@@ -48,6 +48,12 @@ pub enum ColumnChange {
     Alter {
         /// Name of the column
         name: String,
+        /// The column as the entity declares it
+        ///
+        /// MySQL `MODIFY COLUMN` replaces the whole definition, so building
+        /// the statement needs the complete target and not only the aspects
+        /// that changed.
+        to: ColumnSchema,
         /// The aspects that differ; never empty
         aspects: Vec<ColumnAspect>,
     },
@@ -121,6 +127,7 @@ fn diff_columns(expected: &[ColumnSchema], actual: &[ColumnSchema]) -> Vec<Colum
                 if !aspects.is_empty() {
                     changes.push(ColumnChange::Alter {
                         name: wanted.name.clone(),
+                        to: wanted.clone(),
                         aspects,
                     });
                 }
@@ -274,17 +281,14 @@ mod tests {
 
     #[test]
     fn detects_type_and_nullability_changes() {
-        let expected = table(
-            "users",
-            vec![ColumnSchema {
-                name: "age".to_string(),
-                col_type: "bigint".to_string(),
-                nullable: false,
-                default: None,
-                auto_increment: false,
-            }],
-            vec![],
-        );
+        let wanted = ColumnSchema {
+            name: "age".to_string(),
+            col_type: "bigint".to_string(),
+            nullable: false,
+            default: None,
+            auto_increment: false,
+        };
+        let expected = table("users", vec![wanted.clone()], vec![]);
         let actual = table("users", vec![column("age", "int")], vec![]);
 
         let diff = diff_table(&expected, &actual);
@@ -294,6 +298,7 @@ mod tests {
             diff.columns[0],
             ColumnChange::Alter {
                 name: "age".to_string(),
+                to: wanted,
                 aspects: vec![
                     ColumnAspect::Type {
                         from: "int".to_string(),
@@ -310,17 +315,14 @@ mod tests {
 
     #[test]
     fn detects_default_and_auto_increment_changes() {
-        let expected = table(
-            "users",
-            vec![ColumnSchema {
-                name: "id".to_string(),
-                col_type: "int".to_string(),
-                nullable: false,
-                default: None,
-                auto_increment: true,
-            }],
-            vec![],
-        );
+        let wanted = ColumnSchema {
+            name: "id".to_string(),
+            col_type: "int".to_string(),
+            nullable: false,
+            default: None,
+            auto_increment: true,
+        };
+        let expected = table("users", vec![wanted.clone()], vec![]);
         let actual = table(
             "users",
             vec![ColumnSchema {
@@ -339,6 +341,7 @@ mod tests {
             diff.columns[0],
             ColumnChange::Alter {
                 name: "id".to_string(),
+                to: wanted,
                 aspects: vec![
                     ColumnAspect::Default {
                         from: Some("7".to_string()),

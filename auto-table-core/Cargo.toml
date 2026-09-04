@@ -20,3 +20,6 @@ sea-orm.workspace = true
 inventory.workspace = true
 thiserror.workspace = true
 auto-table-derive.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -22,13 +22,17 @@ use sea_orm::sea_query::TableCreateStatement;
 use sea_orm::{DatabaseConnection, DbBackend};
 
 pub mod diff;
+pub mod migrate;
 pub mod parse;
 pub mod schema;
 
 pub use diff::{
     diff_table, ColumnAspect, ColumnChange, IndexChange, TableDiff,
 };
-pub use parse::{parse_create_table, ParseError};
+pub use migrate::{
+    apply_migrations, plan_migrations, plan_table_statements, MigrationPlan, TableMigration,
+};
+pub use parse::{parse_create_table, ParseError, PRIMARY_INDEX_NAME};
 pub use schema::{get_table_schema, ColumnSchema, IndexSchema, TableSchema};
 
 /// Errors related to automatic table creation (precise library-level error type)
@@ -58,6 +62,24 @@ pub enum TableError {
     QuerySchemaFailed {
         /// The table whose structure could not be read
         table: String,
+        /// Underlying database error
+        #[source]
+        source: sea_orm::DbErr,
+    },
+    /// Failed to parse the structure an entity declares
+    #[error("failed to parse the declared structure of table `{table}`: {source}")]
+    ParseExpectedFailed {
+        /// The table whose declaration could not be parsed
+        table: String,
+        /// The parse failure
+        #[source]
+        source: ParseError,
+    },
+    /// A migration statement failed to execute
+    #[error("migration statement failed: {sql}")]
+    MigrationFailed {
+        /// The statement that failed
+        sql: String,
         /// Underlying database error
         #[source]
         source: sea_orm::DbErr,

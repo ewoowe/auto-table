@@ -17,7 +17,7 @@ use crate::schema::{unquote_literal, ColumnSchema, IndexSchema, TableSchema};
 /// sea-query gives the primary key constraint its own generated name (such as
 /// `pk-sample_memberships`), but the database always reports it as `PRIMARY`.
 /// Using this constant keeps both sides of a diff comparable.
-const PRIMARY_INDEX_NAME: &str = "PRIMARY";
+pub const PRIMARY_INDEX_NAME: &str = "PRIMARY";
 
 /// Types spelled with more than one word, longest first so that the most
 /// specific match wins
