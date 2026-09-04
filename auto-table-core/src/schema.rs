@@ -174,8 +174,7 @@ pub async fn get_table_schema_mysql(
 /// Integer types whose trailing display width carries no meaning
 ///
 /// MySQL reports these as `int(11)`, `bigint(20)` and so on, while sea-query
-/// emits plain `int` / `bigint`. `tinyint(1)` is deliberately excluded: it is
-/// the conventional mapping of a boolean and SeaORM emits it as-is.
+/// emits plain `int` / `bigint`.
 const INT_TYPES_WITH_DISPLAY_WIDTH: [&str; 6] = [
     "tinyint",
     "smallint",
@@ -185,15 +184,22 @@ const INT_TYPES_WITH_DISPLAY_WIDTH: [&str; 6] = [
     "bigint",
 ];
 
-/// Normalizes a MySQL `COLUMN_TYPE` into a comparable form
+/// Normalizes a MySQL `COLUMN_TYPE` so it can be compared against the type
+/// that sea-query emits for the same Rust field
 ///
-/// - lowercases the value and collapses runs of whitespace
-/// - drops the display width of integer types (`int(11)` -> `int`), except for
-///   `tinyint(1)`
-/// - sorts trailing modifiers so `int unsigned` and `int unsigned zerofill`
-///   compare predictably
+/// The direction matters: the goal is to rewrite what MySQL *reports* into
+/// what sea-query *generates*, so that both sides converge on one spelling.
 ///
-/// Lengths that carry meaning are preserved: `varchar(255)`, `decimal(10,2)`.
+/// - `tinyint(1)` -> `bool`, because `BOOL` is only a MySQL alias for
+///   `TINYINT(1)` and sea-query emits `bool`
+/// - `decimal(10,0)` -> `decimal`, because MySQL always reports the default
+///   precision while sea-query emits the bare type
+/// - drops the display width of integer types (`int(11)` -> `int`)
+/// - lowercases the value and sorts trailing modifiers, so `int(10) unsigned
+///   zerofill` and `int zerofill unsigned` compare equal
+///
+/// Lengths and precisions that carry meaning are preserved, e.g.
+/// `varchar(255)` and `decimal(10,2)`.
 pub fn normalize_mysql_type(raw: &str) -> String {
     let lowered = raw.trim().to_ascii_lowercase();
     let mut parts = lowered.split_whitespace();
@@ -205,7 +211,14 @@ pub fn normalize_mysql_type(raw: &str) -> String {
     let mut modifiers: Vec<&str> = parts.collect();
     modifiers.sort_unstable();
 
-    let mut out = strip_int_display_width(base).to_string();
+    let base = match base {
+        "tinyint(1)" | "boolean" => "bool",
+        "decimal(10,0)" => "decimal",
+        "numeric(10,0)" => "numeric",
+        other => strip_int_display_width(other),
+    };
+
+    let mut out = base.to_string();
     for modifier in modifiers {
         out.push(' ');
         out.push_str(modifier);
@@ -214,21 +227,14 @@ pub fn normalize_mysql_type(raw: &str) -> String {
 }
 
 /// Removes the display width from an integer type, e.g. `int(11)` -> `int`
-///
-/// `tinyint(1)` is left untouched because it is how MySQL represents booleans.
 fn strip_int_display_width(base: &str) -> &str {
     for int_type in INT_TYPES_WITH_DISPLAY_WIDTH {
         let Some(rest) = base.strip_prefix(int_type) else {
             continue;
         };
-        if !rest.starts_with('(') || !rest.ends_with(')') {
-            continue;
+        if rest.starts_with('(') && rest.ends_with(')') {
+            return int_type;
         }
-        // `tinyint(1)` is a boolean, not a display width
-        if int_type == "tinyint" && rest == "(1)" {
-            return base;
-        }
-        return int_type;
     }
     base
 }
@@ -251,16 +257,28 @@ mod tests {
     }
 
     #[test]
-    fn keeps_tinyint_one_because_it_is_a_boolean() {
-        assert_eq!(normalize_mysql_type("tinyint(1)"), "tinyint(1)");
+    fn maps_tinyint_one_to_bool() {
+        // MySQL stores booleans as tinyint(1) while sea-query emits `bool`
+        assert_eq!(normalize_mysql_type("tinyint(1)"), "bool");
+        assert_eq!(normalize_mysql_type("TINYINT(1)"), "bool");
+        assert_eq!(normalize_mysql_type("boolean"), "bool");
+        // A genuine tinyint keeps its own identity
         assert_eq!(normalize_mysql_type("tinyint(4)"), "tinyint");
     }
 
     #[test]
-    fn preserves_meaningful_lengths_and_precision() {
+    fn drops_default_decimal_precision() {
+        // MySQL always reports the default precision, sea-query omits it
+        assert_eq!(normalize_mysql_type("decimal(10,0)"), "decimal");
+        assert_eq!(normalize_mysql_type("numeric(10,0)"), "numeric");
+        // An explicit precision is meaningful and must be preserved
+        assert_eq!(normalize_mysql_type("decimal(10,2)"), "decimal(10,2)");
+    }
+
+    #[test]
+    fn preserves_meaningful_lengths() {
         assert_eq!(normalize_mysql_type("varchar(255)"), "varchar(255)");
         assert_eq!(normalize_mysql_type("char(32)"), "char(32)");
-        assert_eq!(normalize_mysql_type("decimal(10,2)"), "decimal(10,2)");
     }
 
     #[test]
