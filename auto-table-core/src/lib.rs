@@ -84,6 +84,12 @@ pub enum TableError {
         #[source]
         source: sea_orm::DbErr,
     },
+    /// A rebuild needs the `CREATE TABLE` statement, but none was supplied
+    #[error("rebuilding table `{table}` requires its CREATE TABLE statement")]
+    MissingCreateStatement {
+        /// The table that would have been rebuilt
+        table: String,
+    },
 }
 
 /// Wrapper structure used for inventory collection

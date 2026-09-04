@@ -10,13 +10,32 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-
+  test:
     runs-on: ubuntu-latest
+
+    # The MySQL end-to-end tests need a real server. SQLite needs none: it uses
+    # the bundled engine against a temporary file.
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: auto_table_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    env:
+      AUTO_TABLE_TEST_DATABASE_URL: mysql://root:root@127.0.0.1:3306/auto_table_test
 
     steps:
     - uses: actions/checkout@v4
     - name: Build
       run: cargo build --verbose
     - name: Run tests
-      run: cargo test --verbose
+      # --all-features so the SQLite end-to-end tests are compiled in as well
+      run: cargo test --all-features --verbose

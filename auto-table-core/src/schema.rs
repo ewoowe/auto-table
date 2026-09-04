@@ -11,6 +11,7 @@
 
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement, Value};
 
+use crate::parse::PRIMARY_INDEX_NAME;
 use crate::TableError;
 
 /// Normalized snapshot of a single column
@@ -65,6 +66,7 @@ pub async fn get_table_schema(
 ) -> Result<TableSchema, TableError> {
     match db.get_database_backend() {
         DbBackend::MySql => get_table_schema_mysql(db, table_name).await,
+        DbBackend::Sqlite => get_table_schema_sqlite(db, table_name).await,
         other => Err(TableError::UnsupportedBackend(other)),
     }
 }
@@ -172,6 +174,223 @@ pub async fn get_table_schema_mysql(
         columns,
         indexes,
     })
+}
+
+/// Reads the current structure of `table_name` from a SQLite database
+///
+/// SQLite publishes its catalogue through `PRAGMA`s instead of
+/// `information_schema`, and PRAGMAs take no bind parameters, so the table name
+/// is quoted into the statement as a literal.
+///
+/// Two SQLite specifics are handled here:
+///
+/// - The primary key of a rowid table is **not** listed by `pragma_index_list`;
+///   it is rebuilt from the `pk` column of `pragma_table_info` and reported
+///   under the same name MySQL uses, so both sides of a diff line up.
+/// - `AUTOINCREMENT` is not exposed per column at all, so it is read from the
+///   stored `CREATE TABLE` statement and attributed to the primary key.
+pub async fn get_table_schema_sqlite(
+    db: &DatabaseConnection,
+    table_name: &str,
+) -> Result<TableSchema, TableError> {
+    let fail = |source| TableError::QuerySchemaFailed {
+        table: table_name.to_string(),
+        source,
+    };
+
+    let column_rows = db
+        .query_all_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            format!(
+                "SELECT name, type, \"notnull\", dflt_value, pk FROM pragma_table_info({})",
+                quote_sqlite_literal(table_name)
+            ),
+        ))
+        .await
+        .map_err(fail)?;
+
+    let mut columns = Vec::with_capacity(column_rows.len());
+    let mut primary_key: Vec<(i64, String)> = Vec::new();
+
+    for row in &column_rows {
+        let Some(name) = row.try_get_by_index::<String>(0).ok() else {
+            continue;
+        };
+
+        // SQLite allows a column with no declared type; report it as empty so
+        // that the affinity calculation treats it as BLOB, like SQLite does.
+        let col_type = row.try_get_by_index::<String>(1).unwrap_or_default();
+        let not_null = row.try_get_by_index::<i64>(2).unwrap_or(0);
+        let default = row
+            .try_get_by_index::<String>(3)
+            .ok()
+            .map(|value| unquote_literal(&value));
+        let pk_position = row.try_get_by_index::<i64>(4).unwrap_or(0);
+
+        if pk_position > 0 {
+            primary_key.push((pk_position, name.clone()));
+        }
+
+        columns.push(ColumnSchema {
+            name,
+            col_type: sqlite_type_affinity(&col_type),
+            nullable: not_null == 0,
+            default,
+            // Filled in below, once AUTOINCREMENT is known
+            auto_increment: false,
+        });
+    }
+
+    let auto_increment = table_is_auto_increment(db, table_name).await.map_err(fail)?;
+    if auto_increment {
+        for column in &mut columns {
+            column.auto_increment = primary_key
+                .iter()
+                .any(|(_, name)| *name == column.name);
+        }
+    }
+
+    let mut indexes = Vec::new();
+
+    // The primary key first, so it lines up with how MySQL reports it
+    primary_key.sort_by_key(|(position, _)| *position);
+    if !primary_key.is_empty() {
+        indexes.push(IndexSchema {
+            name: PRIMARY_INDEX_NAME.to_string(),
+            columns: primary_key
+                .into_iter()
+                .map(|(_, name)| name)
+                .collect(),
+            unique: true,
+            primary: true,
+        });
+    }
+
+    let index_rows = db
+        .query_all_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            format!(
+                "SELECT name, \"unique\", origin FROM pragma_index_list({})",
+                quote_sqlite_literal(table_name)
+            ),
+        ))
+        .await
+        .map_err(fail)?;
+
+    for row in &index_rows {
+        let Some(index_name) = row.try_get_by_index::<String>(0).ok() else {
+            continue;
+        };
+        let unique = row.try_get_by_index::<i64>(1).unwrap_or(0);
+        let origin = row.try_get_by_index::<String>(2).unwrap_or_default();
+
+        // The primary key is already reported above, from `pragma_table_info`
+        if origin == "pk" {
+            continue;
+        }
+
+        let column_rows = db
+            .query_all_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                format!(
+                    "SELECT name FROM pragma_index_info({}) ORDER BY seqno",
+                    quote_sqlite_literal(&index_name)
+                ),
+            ))
+            .await
+            .map_err(fail)?;
+
+        let columns: Vec<String> = column_rows
+            .iter()
+            .filter_map(|row| row.try_get_by_index::<String>(0).ok())
+            .collect();
+        if columns.is_empty() {
+            continue;
+        }
+
+        // SQLite creates an index for every UNIQUE constraint and names it
+        // `sqlite_autoindex_<table>_<n>`; such an index cannot be dropped on
+        // its own. Naming it after its columns matches what parsing the
+        // entity's own CREATE TABLE produces, which keeps the two sides of a
+        // diff in agreement.
+        let name = if origin == "u" {
+            columns.join("_")
+        } else {
+            index_name
+        };
+
+        indexes.push(IndexSchema {
+            name,
+            columns,
+            unique: unique != 0,
+            primary: false,
+        });
+    }
+
+    Ok(TableSchema {
+        name: table_name.to_string(),
+        columns,
+        indexes,
+    })
+}
+
+/// Whether the table was declared with `AUTOINCREMENT`
+///
+/// SQLite keeps this only in the stored `CREATE TABLE` text.
+async fn table_is_auto_increment(
+    db: &DatabaseConnection,
+    table_name: &str,
+) -> Result<bool, sea_orm::DbErr> {
+    let rows = db
+        .query_all_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            format!(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = {}",
+                quote_sqlite_literal(table_name)
+            ),
+        ))
+        .await?;
+
+    let found = rows
+        .iter()
+        .filter_map(|row| row.try_get_by_index::<String>(0).ok())
+        .any(|sql| sql.to_ascii_uppercase().contains("AUTOINCREMENT"));
+
+    Ok(found)
+}
+
+/// The type affinity SQLite assigns to a declared type
+///
+/// SQLite does not enforce declared types: `int`, `integer` and `bigint` all
+/// end up with INTEGER affinity and store the same values. Comparing the
+/// declared spellings would therefore report a difference for a change such as
+/// `i32` -> `i64` and trigger a pointless table rebuild. Normalizing to the
+/// five affinities keeps the comparison meaningful.
+///
+/// The rules are the ones SQLite itself documents, in order:
+/// `INT` -> INTEGER, `CHAR`/`CLOB`/`TEXT` -> TEXT, `BLOB`/empty -> BLOB,
+/// `REAL`/`FLOA`/`DOUB` -> REAL, anything else -> NUMERIC.
+pub fn sqlite_type_affinity(declared: &str) -> String {
+    let upper = declared.to_ascii_uppercase();
+
+    let affinity = if upper.contains("INT") {
+        "INTEGER"
+    } else if upper.contains("CHAR") || upper.contains("CLOB") || upper.contains("TEXT") {
+        "TEXT"
+    } else if upper.contains("BLOB") || upper.trim().is_empty() {
+        "BLOB"
+    } else if upper.contains("REAL") || upper.contains("FLOA") || upper.contains("DOUB") {
+        "REAL"
+    } else {
+        "NUMERIC"
+    };
+
+    affinity.to_string()
+}
+
+/// Quotes a string literal, escaping the quotes it contains
+fn quote_sqlite_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 /// Integer types whose trailing display width carries no meaning
@@ -314,5 +533,43 @@ mod tests {
     fn handles_empty_input() {
         assert_eq!(normalize_mysql_type(""), "");
         assert_eq!(normalize_mysql_type("   "), "");
+    }
+
+    #[test]
+    fn sqlite_affinity_groups_integer_spellings() {
+        // int / integer / bigint all have INTEGER affinity and store the same
+        // values, which is exactly why `i32` -> `i64` must not look like a change
+        for declared in ["integer", "int", "bigint", "INTEGER", "Int"] {
+            assert_eq!(sqlite_type_affinity(declared), "INTEGER", "{declared}");
+        }
+    }
+
+    #[test]
+    fn sqlite_affinity_follows_the_documented_rules() {
+        assert_eq!(sqlite_type_affinity("varchar(255)"), "TEXT");
+        assert_eq!(sqlite_type_affinity("char(32)"), "TEXT");
+        assert_eq!(sqlite_type_affinity("clob"), "TEXT");
+        assert_eq!(sqlite_type_affinity("timestamp_with_timezone_text"), "TEXT");
+
+        assert_eq!(sqlite_type_affinity("blob"), "BLOB");
+        assert_eq!(sqlite_type_affinity(""), "BLOB");
+
+        assert_eq!(sqlite_type_affinity("real"), "REAL");
+        assert_eq!(sqlite_type_affinity("double"), "REAL");
+        assert_eq!(sqlite_type_affinity("real_decimal"), "REAL");
+
+        // Anything else is NUMERIC
+        assert_eq!(sqlite_type_affinity("boolean"), "NUMERIC");
+        assert_eq!(sqlite_type_affinity("decimal"), "NUMERIC");
+    }
+
+    #[test]
+    fn widening_i32_to_i64_is_not_a_difference_on_sqlite() {
+        // Both sides normalize to the same affinity, so no rebuild is triggered
+        assert_eq!(sqlite_type_affinity("int"), sqlite_type_affinity("bigint"));
+        assert_eq!(
+            sqlite_type_affinity("varchar(50)"),
+            sqlite_type_affinity("varchar(255)")
+        );
     }
 }
