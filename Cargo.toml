@@ -15,7 +15,11 @@ keywords = ["sea-orm", "database", "table", "proc-macro", "orm"]
 categories = ["database", "development-tools::procedural-macro-helpers"]
 
 [workspace.dependencies]
-sea-orm = { version = "2.0.0", features = ["sqlx-mysql", "runtime-tokio-rustls", "macros"] }
+# The database driver is intentionally NOT listed here: it is opt-in through
+# the `mysql` / `postgres` / `sqlite` features of auto-table-core, so that
+# users only compile the drivers they actually need. The runtime and the
+# derive macros are always required.
+sea-orm = { version = "2.0.0", features = ["runtime-tokio-rustls", "macros"] }
 inventory = "0.3"
 thiserror = "1"
 syn = { version = "3.0.3", features = ["full"] }

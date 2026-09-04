@@ -8,6 +8,13 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+default = ["mysql"]
+# Database drivers (opt-in; they are additive, so several can be enabled at once)
+mysql = ["sea-orm/sqlx-mysql"]
+postgres = ["sea-orm/sqlx-postgres"]
+sqlite = ["sea-orm/sqlx-sqlite"]
+
 [dependencies]
 sea-orm.workspace = true
 inventory.workspace = true

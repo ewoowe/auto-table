@@ -8,6 +8,16 @@
 //! macro-generated code) can absorb and propagate it with `anyhow` or a
 //! custom error type.
 
+// Backend feature guard: at least one database driver must be enabled.
+// Without any of them sea-orm is compiled without a sqlx driver, which makes
+// connecting to a database impossible while still compiling successfully.
+#[cfg(not(any(feature = "mysql", feature = "postgres", feature = "sqlite")))]
+compile_error!(
+    "auto-table-core requires at least one database backend feature; enable \
+     one of `mysql`, `postgres` or `sqlite`, e.g. `auto-table-core = { \
+     version = \"0.3.0\", default-features = false, features = [\"postgres\"] }`."
+);
+
 use sea_orm::sea_query::TableCreateStatement;
 use sea_orm::{DatabaseConnection, DbBackend};
 

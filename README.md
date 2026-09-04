@@ -64,6 +64,22 @@ The macro locates the `let db = ...` binding in the function body and injects th
 
 The injected logic performs no logging. Instead, the generated table-creation function returns an [`auto_table_core::TableCreationReport`](auto-table-core/src/lib.rs), which contains `existing_tables` (tables that already existed and were skipped) and `created_tables` (tables created in this run). The injected statement binds this report to a local variable named `__auto_table_report`, which is in scope for the rest of the function body, so you can log or act on the result there. The name starts with an underscore, so leaving it unused does not trigger a warning. You can also call [`auto_table_core::create_missing_tables`](auto-table-core/src/lib.rs) directly if you need the report outside the macro.
 
+### 3. Backend feature flags
+
+Only the MySQL driver is enabled by default. Switch or combine as needed (`default = ["mysql"]`):
+
+```toml
+# PostgreSQL only
+auto-table-core = { version = "0.3.0", default-features = false, features = ["postgres"] }
+
+# Both MySQL and SQLite
+auto-table-core = { version = "0.3.0", default-features = false, features = ["mysql", "sqlite"] }
+```
+
+Available features: `mysql`, `postgres`, `sqlite`. They are additive, so several can be enabled at once; **at least one is required**, otherwise compilation fails immediately.
+
+> The features only decide which **database drivers** get compiled. The backend is determined at runtime by `DbBackend`, so logic such as querying existing tables works for all three backends regardless.
+
 ## Supported backends
 
 - MySQL
@@ -80,9 +96,11 @@ The core library exposes a precise [`auto_table_core::TableError`](auto-table-co
   - Diff entity definitions against live table schemas and generate `ALTER TABLE` statements automatically
   - Add/drop columns, change column types and constraints, manage indexes and unique constraints
   - Dry-run mode to preview the migration SQL before executing it
-  - A migration bookkeeping table so each migration runs only once
-- [ ] Rollback (down migration) support
-- [ ] Finer-grained backend feature flags (opt-in MySQL / PostgreSQL / SQLite)
+  - Risk classification: operations that can lose data (dropping a column, narrowing a type) require explicit opt-in and are never applied automatically
+  - Concurrency safety: when several instances start at once, a database lock (`GET_LOCK` / `pg_advisory_lock` / an exclusive SQLite transaction) ensures only one of them migrates
+- [ ] **SQLite table rebuild** — SQLite has no `MODIFY COLUMN` and only supports `DROP COLUMN` since 3.35, so structural changes must go through the "create new table → copy data → drop old → rename" procedure; this needs a dedicated implementation
+- [ ] Rollback (down migration) support — migrations here are declarative (diff the current state against the target state), so a `down` cannot be generated reliably: data is already gone after `DROP COLUMN`, and MySQL/SQLite DDL does not roll back inside a transaction. Plan: first ship "best-effort rollback via reverse operations on failure", and make lossy steps fail loudly instead of silently continuing
+- [x] Finer-grained backend feature flags (opt-in MySQL / PostgreSQL / SQLite)
 
 ## License
 
