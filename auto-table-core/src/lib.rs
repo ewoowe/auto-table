@@ -21,6 +21,10 @@ compile_error!(
 use sea_orm::sea_query::TableCreateStatement;
 use sea_orm::{DatabaseConnection, DbBackend};
 
+pub mod schema;
+
+pub use schema::{get_table_schema, ColumnSchema, IndexSchema, TableSchema};
+
 /// Errors related to automatic table creation (precise library-level error type)
 ///
 /// The public API of the library returns this type so callers can `match`
@@ -43,6 +47,15 @@ pub enum TableError {
     /// Unsupported database backend
     #[error("unsupported database backend: {0:?}")]
     UnsupportedBackend(DbBackend),
+    /// Failed to read the structure of an existing table (underlying database error)
+    #[error("failed to read the schema of table `{table}`: {source}")]
+    QuerySchemaFailed {
+        /// The table whose structure could not be read
+        table: String,
+        /// Underlying database error
+        #[source]
+        source: sea_orm::DbErr,
+    },
 }
 
 /// Wrapper structure used for inventory collection
