@@ -21,8 +21,10 @@ compile_error!(
 use sea_orm::sea_query::TableCreateStatement;
 use sea_orm::{DatabaseConnection, DbBackend};
 
+pub mod parse;
 pub mod schema;
 
+pub use parse::{parse_create_table, ParseError};
 pub use schema::{get_table_schema, ColumnSchema, IndexSchema, TableSchema};
 
 /// Errors related to automatic table creation (precise library-level error type)
