@@ -10,7 +10,7 @@
 //! tolerant: unrecognized table-level items are skipped rather than failing the
 //! whole statement.
 
-use crate::schema::{ColumnSchema, IndexSchema, TableSchema};
+use crate::schema::{unquote_literal, ColumnSchema, IndexSchema, TableSchema};
 
 /// Name MySQL reports for the primary key in `INFORMATION_SCHEMA.STATISTICS`
 ///
@@ -415,15 +415,6 @@ fn unquote_identifier(s: &str) -> String {
         if matches {
             return s[1..s.len() - 1].trim().to_string();
         }
-    }
-    s.to_string()
-}
-
-/// Strips the surrounding quotes from a string literal
-fn unquote_literal(s: &str) -> String {
-    let s = s.trim();
-    if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') {
-        return s[1..s.len() - 1].to_string();
     }
     s.to_string()
 }

@@ -21,9 +21,13 @@ compile_error!(
 use sea_orm::sea_query::TableCreateStatement;
 use sea_orm::{DatabaseConnection, DbBackend};
 
+pub mod diff;
 pub mod parse;
 pub mod schema;
 
+pub use diff::{
+    diff_table, ColumnAspect, ColumnChange, IndexChange, TableDiff,
+};
 pub use parse::{parse_create_table, ParseError};
 pub use schema::{get_table_schema, ColumnSchema, IndexSchema, TableSchema};
 

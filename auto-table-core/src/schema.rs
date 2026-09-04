@@ -114,7 +114,10 @@ pub async fn get_table_schema_mysql(
             .try_get_by_index::<String>(2)
             .map(|v| v.eq_ignore_ascii_case("YES"))
             .unwrap_or(false);
-        let default = row.try_get_by_index::<String>(3).ok();
+        let default = row
+            .try_get_by_index::<String>(3)
+            .ok()
+            .map(|value| unquote_literal(&value));
         let extra = row.try_get_by_index::<String>(4).unwrap_or_default();
 
         columns.push(ColumnSchema {
@@ -237,6 +240,19 @@ fn strip_int_display_width(base: &str) -> &str {
         }
     }
     base
+}
+
+/// Strips the quotes around a literal default value
+///
+/// MySQL 8 reports `DEFAULT 'member'` as `member`, while some 5.x builds keep
+/// the surrounding quotes; sea-query always emits the quoted literal. Without
+/// this, every string default would show up as a spurious difference.
+pub(crate) fn unquote_literal(s: &str) -> String {
+    let s = s.trim();
+    if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') {
+        return s[1..s.len() - 1].to_string();
+    }
+    s.to_string()
 }
 
 #[cfg(test)]
