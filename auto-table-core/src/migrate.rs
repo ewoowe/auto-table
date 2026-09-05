@@ -16,7 +16,7 @@ use sea_orm::{
 use crate::diff::{diff_table, TableDiff};
 use crate::parse::parse_create_table;
 use crate::backend::AnyBackend;
-use crate::risk::{classify, Risk};
+use crate::risk::{classify, classify_changes, ChangeKind, Risk, RiskAction, RiskPolicy};
 use crate::schema::get_table_schema;
 use crate::{get_all_table_statements, get_existing_tables, get_table_name, Backend, TableError};
 
@@ -35,6 +35,9 @@ pub struct TableMigration {
     pub transactional: bool,
     /// How dangerous the change is, so callers can refuse to apply it
     pub risk: Risk,
+    /// Every change in the table, paired with its kind and risk, so the plan can
+    /// be evaluated against a [`RiskPolicy`] item by item.
+    pub changes: Vec<(ChangeKind, Risk)>,
 }
 
 impl TableMigration {
@@ -45,6 +48,7 @@ impl TableMigration {
             statements,
             transactional: false,
             risk: Risk::Safe,
+            changes: Vec::new(),
         }
     }
 
@@ -55,6 +59,7 @@ impl TableMigration {
             statements,
             transactional: true,
             risk: Risk::Safe,
+            changes: Vec::new(),
         }
     }
 }
@@ -126,7 +131,7 @@ pub enum LockBehavior {
 }
 
 /// Options for [`apply_migrations_with`]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrateOptions {
     /// What to do when another instance may be migrating
     pub lock: LockBehavior,
@@ -134,9 +139,17 @@ pub struct MigrateOptions {
     pub lock_timeout_secs: u32,
     /// Whether destructive changes (e.g. dropping a column) may be applied
     ///
-    /// `false` by default: a plan containing one is refused unless the plan
-    /// itself was built with [`MigrationPlan::allow_destructive`].
+    /// `false` by default. Equivalent to setting
+    /// `risk_policy.levels[Destructive] = RiskAction::Allow`, so an explicit
+    /// item-level `Block` in [`risk_policy`](Self::risk_policy) still wins.
+    /// Prefer configuring `risk_policy` directly for finer control.
     pub allow_destructive: bool,
+    /// Three-layer switch controlling which risk items may be applied.
+    ///
+    /// `global` applies to every change, `levels` to a risk level, and `items`
+    /// to a specific [`ChangeKind`]; the most specific layer wins. See
+    /// [`RiskPolicy`].
+    pub risk_policy: RiskPolicy,
 }
 
 impl Default for MigrateOptions {
@@ -145,6 +158,7 @@ impl Default for MigrateOptions {
             lock: LockBehavior::None,
             lock_timeout_secs: 0,
             allow_destructive: false,
+            risk_policy: RiskPolicy::default(),
         }
     }
 }
@@ -156,6 +170,7 @@ impl MigrateOptions {
             lock: LockBehavior::Required,
             lock_timeout_secs: timeout_secs,
             allow_destructive: false,
+            risk_policy: RiskPolicy::default(),
         }
     }
 
@@ -165,7 +180,14 @@ impl MigrateOptions {
             lock: LockBehavior::SkipIfLocked,
             lock_timeout_secs: timeout_secs,
             allow_destructive: false,
+            risk_policy: RiskPolicy::default(),
         }
+    }
+
+    /// Configure the three-layer risk policy used when applying the plan.
+    pub fn with_risk_policy(mut self, policy: RiskPolicy) -> Self {
+        self.risk_policy = policy;
+        self
     }
 
     /// Allow destructive changes (such as dropping a column) to be applied
@@ -221,6 +243,7 @@ pub async fn plan_migrations(db: &DatabaseConnection) -> Result<MigrationPlan, T
 
         let mut migration = backend_impl.plan(&diff, &create_sql)?;
         migration.risk = classify(&diff);
+        migration.changes = classify_changes(&diff);
         tables.push(migration);
     }
 
@@ -273,18 +296,43 @@ pub async fn migrate(
 /// Under a lock the plan is rebuilt once the lock is held, so `plan` only
 /// decides whether migrating is worth attempting at all. Use [`migrate`] to
 /// plan and apply without building a plan twice.
-/// Refuses a plan that contains a destructive change unless `allow` is set
-fn ensure_allowed(plan: &MigrationPlan, allow: bool) -> Result<(), TableError> {
-    if allow || !plan.risk().is_destructive() {
-        return Ok(());
+/// Combines the plan and options into a single risk policy.
+///
+/// `allow_destructive` (on either the plan or the options) is shorthand for
+/// "allow the `Destructive` level", so it only ever loosens the configured
+/// [`RiskPolicy`]. Because an explicit item-level rule in `items` (L3) outranks
+/// a level rule (L2), an `allow_destructive` call cannot override a policy that
+/// explicitly blocks a specific [`ChangeKind`].
+fn effective_policy(plan: &MigrationPlan, options: &MigrateOptions) -> RiskPolicy {
+    let mut policy = options.risk_policy.clone();
+    if plan.allow_destructive || options.allow_destructive {
+        policy.levels.insert(Risk::Destructive, RiskAction::Allow);
     }
-    let tables: Vec<String> = plan
-        .tables
-        .iter()
-        .filter(|table| table.risk.is_destructive())
-        .map(|table| table.table.clone())
-        .collect();
-    Err(TableError::DestructiveChangesBlocked { tables })
+    policy
+}
+
+/// Refuses a plan that contains a change blocked by `policy`, listing every
+/// blocked change so callers know exactly what was refused.
+fn ensure_allowed(plan: &MigrationPlan, policy: &RiskPolicy) -> Result<(), TableError> {
+    let mut tables = Vec::new();
+    let mut blocked: Vec<String> = Vec::new();
+    for table in &plan.tables {
+        let mut table_blocked = false;
+        for (kind, level) in &table.changes {
+            if policy.resolve(*kind, *level) == RiskAction::Block {
+                blocked.push(format!("{}: {}", table.table, kind));
+                table_blocked = true;
+            }
+        }
+        if table_blocked && !tables.contains(&table.table) {
+            tables.push(table.table.clone());
+        }
+    }
+    if blocked.is_empty() {
+        Ok(())
+    } else {
+        Err(TableError::DestructiveChangesBlocked { tables, blocked })
+    }
 }
 
 pub async fn apply_migrations_with(
@@ -296,9 +344,10 @@ pub async fn apply_migrations_with(
         return Ok(MigrationOutcome::Applied);
     }
 
-    // Check first, run never: refuse any destructive change unless explicitly
-    // allowed, before a single statement executes.
-    ensure_allowed(plan, plan.allow_destructive || options.allow_destructive)?;
+    // Check first, run never: refuse any blocked risk item before a single
+    // statement executes.
+    let policy = effective_policy(plan, &options);
+    ensure_allowed(plan, &policy)?;
 
     if options.lock == LockBehavior::None {
         for migration in &plan.tables {
@@ -336,6 +385,7 @@ pub fn plan_table_migration(
 ) -> Result<TableMigration, TableError> {
     let mut migration = AnyBackend::for_backend(backend)?.plan(diff, create_sql)?;
     migration.risk = classify(diff);
+    migration.changes = classify_changes(diff);
     Ok(migration)
 }
 
@@ -424,15 +474,14 @@ async fn apply_under_lock(
     // stale plan would only fail on statements already applied.
     let plan = plan_migrations(db).await?;
 
-    // Refuse a destructive plan unless explicitly allowed, releasing the lock and
-    // rolling back before returning.
-    if !options.allow_destructive {
-        if let Err(error) = ensure_allowed(&plan, false) {
-            backend.release_lock(&transaction).await?;
-            let _ = transaction.rollback().await;
-            run_outside(db, backend.after_statements()).await?;
-            return Err(error);
-        }
+    // Refuse a plan with blocked risk items, releasing the lock and rolling back
+    // before returning.
+    let policy = effective_policy(&plan, &options);
+    if let Err(error) = ensure_allowed(&plan, &policy) {
+        backend.release_lock(&transaction).await?;
+        let _ = transaction.rollback().await;
+        run_outside(db, backend.after_statements()).await?;
+        return Err(error);
     }
 
     // Already inside a transaction, so statements run as they are: a nested
@@ -556,5 +605,43 @@ mod tests {
 
         assert!(plan.is_empty());
         assert!(plan.statements().is_empty());
+    }
+
+    #[test]
+    fn risk_policy_blocks_according_to_precedence() {
+        // A plan that both drops a column (Destructive) and tightens nullability
+        // (Caution) — exercises the gate without touching a database.
+        let mut plan = MigrationPlan::default();
+        plan.tables.push(TableMigration {
+            table: "t".into(),
+            statements: vec!["ALTER TABLE t DROP COLUMN c".into()],
+            transactional: false,
+            risk: Risk::Destructive,
+            changes: vec![
+                (ChangeKind::DropColumn, Risk::Destructive),
+                (ChangeKind::TightenNullability, Risk::Caution),
+            ],
+        });
+
+        // Default policy blocks only Destructive -> the drop is refused.
+        assert!(ensure_allowed(&plan, &RiskPolicy::default()).is_err());
+
+        // L3 (item) allow for DropColumn, but L3 block for TightenNullability.
+        let mut policy = RiskPolicy::default();
+        policy.items.insert(ChangeKind::DropColumn, RiskAction::Allow);
+        policy.items.insert(ChangeKind::TightenNullability, RiskAction::Block);
+        assert!(ensure_allowed(&plan, &policy).is_err());
+
+        // L2 (level) allow for the whole Caution level -> now everything passes.
+        let mut policy = RiskPolicy::default();
+        policy.items.insert(ChangeKind::DropColumn, RiskAction::Allow);
+        policy.levels.insert(Risk::Caution, RiskAction::Allow);
+        assert!(ensure_allowed(&plan, &policy).is_ok());
+
+        // L1 (global) block still applies to the Caution item with no L3 rule.
+        let mut policy = RiskPolicy::default();
+        policy.global = RiskAction::Block;
+        policy.items.insert(ChangeKind::DropColumn, RiskAction::Allow);
+        assert!(ensure_allowed(&plan, &policy).is_err());
     }
 }

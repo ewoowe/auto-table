@@ -20,7 +20,8 @@ use std::sync::OnceLock;
 
 use auto_table_core::{
     apply_migrations, apply_migrations_with, create_missing_tables, plan_migrations,
-    MigrateOptions, MigrationOutcome, MigrationPlan, TableError,
+    ChangeKind, MigrateOptions, MigrationOutcome, MigrationPlan, Risk, RiskAction, RiskPolicy,
+    TableError,
 };
 use sea_orm::{
     ConnectionTrait, Database, DatabaseConnection, DbBackend, TransactionTrait,
@@ -879,4 +880,95 @@ async fn adds_auto_increment_to_a_primary_key() {
         &["ALTER TABLE `e2e_mysql_autoinc` MODIFY COLUMN `id` int NOT NULL AUTO_INCREMENT"],
     )
     .await;
+}
+
+#[tokio::test]
+async fn policy_item_rule_outranks_allow_destructive() {
+    let _guard = serial().await;
+    let db = connect().await;
+    create_legacy_table(
+        &db,
+        "e2e_drop_column",
+        "`id` int NOT NULL AUTO_INCREMENT, `email` varchar(255) NOT NULL, `obsolete` int DEFAULT NULL, PRIMARY KEY (`id`)",
+    )
+    .await;
+
+    let plan = plan_migrations(&db).await.expect("plan the migration");
+
+    // Block dropping columns at the most specific (item) layer.
+    let mut policy = RiskPolicy::default();
+    policy.items.insert(ChangeKind::DropColumn, RiskAction::Block);
+
+    // Even though `allow_destructive` enables the Destructive *level*, the item
+    // rule (L3) wins and the drop is still refused.
+    let blocked = apply_migrations_with(
+        &db,
+        &plan.allow_destructive(),
+        MigrateOptions::default().with_risk_policy(policy),
+    )
+    .await;
+    assert!(
+        matches!(blocked, Err(TableError::DestructiveChangesBlocked { .. })),
+        "an explicit item-level block must outrank allow_destructive, got {blocked:?}"
+    );
+}
+
+#[tokio::test]
+async fn policy_item_rule_outranks_global_block() {
+    let _guard = serial().await;
+    let db = connect().await;
+    create_legacy_table(
+        &db,
+        "e2e_drop_column",
+        "`id` int NOT NULL AUTO_INCREMENT, `email` varchar(255) NOT NULL, `obsolete` int DEFAULT NULL, PRIMARY KEY (`id`)",
+    )
+    .await;
+
+    let plan = plan_migrations(&db).await.expect("plan the migration");
+
+    // Block everything globally, but explicitly allow dropping columns at L3.
+    let mut policy = RiskPolicy::default();
+    policy.global = RiskAction::Block;
+    policy.items.insert(ChangeKind::DropColumn, RiskAction::Allow);
+
+    apply_migrations_with(
+        &db,
+        &plan,
+        MigrateOptions::default().with_risk_policy(policy),
+    )
+    .await
+    .expect("dropping a column is allowed by the item rule despite a global block");
+}
+
+#[tokio::test]
+async fn policy_level_rule_blocks_caution() {
+    let _guard = serial().await;
+    let db = connect().await;
+    create_legacy_table(
+        &db,
+        "e2e_nullability",
+        "`id` int NOT NULL AUTO_INCREMENT, `name` varchar(255) DEFAULT NULL, PRIMARY KEY (`id`)",
+    )
+    .await;
+
+    let plan = plan_migrations(&db).await.expect("plan the migration");
+    assert!(
+        !statements_for(&plan, "e2e_nullability").is_empty(),
+        "making `name` NOT NULL is a change"
+    );
+
+    // Block the whole Caution level: tightening nullability must be refused.
+    let mut policy = RiskPolicy::default();
+    policy.levels.insert(Risk::Caution, RiskAction::Block);
+
+    let blocked = apply_migrations_with(
+        &db,
+        &plan,
+        MigrateOptions::default().with_risk_policy(policy),
+    )
+    .await;
+    assert!(
+        matches!(blocked, Err(TableError::DestructiveChangesBlocked { .. })),
+        "a caution change must be blocked when the Caution level is blocked, got {blocked:?}"
+    );
 }

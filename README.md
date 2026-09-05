@@ -279,18 +279,31 @@ classification, with all three backends measured:
 API:
 
 ```rust
-// Every change can report its own risk
+// Every change reports both a risk level and a concrete kind
 pub enum Risk { Safe, Caution, Destructive }
+pub enum ChangeKind {
+    AddColumn, AddNotNullColumn, DropColumn, ChangeType,
+    TightenNullability, RelaxNullability, ChangeDefault,
+    ChangeAutoIncrement, AddIndex, DropIndex,
+}
 
 // Default: refuse to run anything if the plan contains a destructive change
 apply_migrations(&db, &plan).await?;
 
-// Run it only after explicit approval
+// Run it only after explicit approval (shorthand for allowing the Destructive level)
 apply_migrations(&db, &plan.allow_destructive()).await?;
 
-// Equivalently, via the options builder used by `migrate`:
-apply_migrations_with(&db, &plan, MigrateOptions::allow_destructive()).await?;
+// Three-layer switch: global (L1) -> levels (L2) -> items (L3).
+// The most specific layer wins; unset layers fall through, global is always on.
+use auto_table_core::{RiskPolicy, RiskAction, ChangeKind, Risk};
+let mut policy = RiskPolicy::default();
+policy.global = RiskAction::Block;                              // L1: block everything
+policy.levels.insert(Risk::Caution, RiskAction::Allow);         // L2: but allow Caution
+policy.items.insert(ChangeKind::DropColumn, RiskAction::Block); // L3: still block drops
+apply_migrations_with(&db, &plan, MigrateOptions::default().with_risk_policy(policy)).await?;
 ```
+
+The three layers take effect in priority order **L3 (concrete kind) > L2 (risk level) > L1 (global)**. `allow_destructive()` is just shorthand for allowing the `Destructive` level, so an explicit `Block` on that concrete change at L3 still overrides it. The default `RiskPolicy` blocks only `Destructive` (dropping a column) and runs everything else.
 
 Two deliberate trade-offs:
 
@@ -314,6 +327,10 @@ Two deliberate trade-offs:
 > tests exercise exactly this — a default apply is rejected with
 > `TableError::DestructiveChangesBlocked`, and only `allow_destructive` makes it run.
 
+> Beyond the all-or-nothing opt-in, a three-layer `RiskPolicy` switch (global / risk
+> level / concrete change kind) lets you `Allow` or `Block` any risk item with the
+> most specific layer winning. The `policy_*` end-to-end tests cover its precedence.
+
 ## Supported backends
 
 Automatic table creation and migrations work with all three.
@@ -329,7 +346,7 @@ The core library exposes a precise [`auto_table_core::TableError`](auto-table-co
 ## Roadmap
 
 - [x] **Database migrations** — available on MySQL, SQLite and PostgreSQL (see "4. Migrating tables that already exist" and "PostgreSQL migration scenarios"). The concurrency lock uses each backend's native mechanism — MySQL `GET_LOCK`, SQLite its write lock plus a `busy_timeout`, PostgreSQL `pg_advisory_lock` (see "5. Concurrency") — and the plan is re-planned after the lock is taken so a stale plan is never replayed.
-  - Risk classification (see "Risk classification") is now enforced: `apply_migrations` refuses any plan that drops a column unless `allow_destructive` is set, and the plan reports its worst risk through [`MigrationPlan::risk`].
+  - Risk classification (see "Risk classification") is now enforced: `apply_migrations` refuses any plan that drops a column unless `allow_destructive` is set, and a three-layer [`RiskPolicy`] (global / risk level / concrete change kind) lets callers allow or block any risk item. The plan reports its worst risk through [`MigrationPlan::risk`].
 - [x] **SQLite migrations (including table rebuild)** — SQLite has no `MODIFY COLUMN`, so changes to a column definition and to indexes or constraints go through "create new table → copy data → drop old → rename", inside a single transaction that rolls back on failure (see "SQLite migration scenarios")
 - [ ] Rollback (down migration) support — migrations here are declarative (diff the current state against the target state), so a `down` cannot be generated reliably: data is already gone after `DROP COLUMN`, and MySQL DDL does not roll back inside a transaction (SQLite does, verified). Plan: first ship "best-effort rollback via reverse operations on failure", and make lossy steps fail loudly instead of silently continuing
 - [x] Finer-grained backend feature flags (opt-in MySQL / PostgreSQL / SQLite)

@@ -38,7 +38,7 @@ pub use migrate::{
     TableMigration,
 };
 pub use parse::{parse_create_table, ParseError, PRIMARY_INDEX_NAME};
-pub use risk::{classify, Risk};
+pub use risk::{classify, ChangeKind, Risk, RiskAction, RiskPolicy};
 pub use schema::{get_table_schema, ColumnSchema, IndexSchema, TableSchema};
 
 /// Errors related to automatic table creation (precise library-level error type)
@@ -102,13 +102,18 @@ pub enum TableError {
         /// How long we waited before giving up
         timeout_secs: u32,
     },
-    /// The plan contained a destructive change (e.g. dropping a column) and was
-    /// refused because it was not explicitly allowed. Opt in with
-    /// [`MigrationPlan::allow_destructive`] or [`MigrateOptions::allow_destructive`].
-    #[error("refusing to apply a destructive migration (dropping columns from: {tables:?}) without explicit approval")]
+    /// The plan contained a change blocked by the active [`crate::RiskPolicy`]
+    /// (e.g. dropping a column) and was refused. `blocked` lists every blocked
+    /// change as `"table: kind"`; `tables` is the deduplicated set of tables that
+    /// contain at least one. Opt in with [`MigrationPlan::allow_destructive`] or
+    /// [`MigrateOptions::allow_destructive`], or loosen the policy's `items` /
+    /// `levels` / `global` layers.
+    #[error("refusing to apply blocked risk items {blocked:?} (tables: {tables:?}) without explicit approval")]
     DestructiveChangesBlocked {
-        /// Tables whose plan drops one or more columns
+        /// Tables that contain at least one blocked change
         tables: Vec<String>,
+        /// Every blocked change, as `"table: kind"`
+        blocked: Vec<String>,
     },
 }
 

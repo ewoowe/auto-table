@@ -231,18 +231,31 @@ PostgreSQL 把列变更拆成**每个方面一条语句**，不像 MySQL 用一�
 API：
 
 ```rust
-// 每个变更可自报风险
+// 每个变更可自报风险等级与具体类型
 pub enum Risk { Safe, Caution, Destructive }
+pub enum ChangeKind {
+    AddColumn, AddNotNullColumn, DropColumn, ChangeType,
+    TightenNullability, RelaxNullability, ChangeDefault,
+    ChangeAutoIncrement, AddIndex, DropIndex,
+}
 
 // 默认：发现破坏性变更就拒绝执行任何语句
 apply_migrations(&db, &plan).await?;
 
-// 显式授权后才执行
+// 显式授权后才执行（等价于把 Destructive 这一风险等级设为允许）
 apply_migrations(&db, &plan.allow_destructive()).await?;
 
-// 也可通过 migrate 所用的 options 构造器：
-apply_migrations_with(&db, &plan, MigrateOptions::allow_destructive()).await?;
+// 三层配置开关：global（全局）→ levels（按风险等级）→ items（按具体变更类型）
+// 越具体的层优先级越高；未设置的层向下回退，global 始终生效。
+use auto_table_core::{RiskPolicy, RiskAction, ChangeKind, Risk};
+let mut policy = RiskPolicy::default();
+policy.global = RiskAction::Block;                            // L1：默认全部拒绝
+policy.levels.insert(Risk::Caution, RiskAction::Allow);       // L2：Caution 放行
+policy.items.insert(ChangeKind::DropColumn, RiskAction::Block); // L3：删列即便被 L2 放行也仍拒绝
+apply_migrations_with(&db, &plan, MigrateOptions::default().with_risk_policy(policy)).await?;
 ```
+
+三层开关的生效优先级为 **L3（具体类型）> L2（风险等级）> L1（全局）**。`allow_destructive()` 是"放行 Destructive 等级"的简写，因此仍会被 L3 上对该具体变更类型的显式 `Block` 覆盖。默认 `RiskPolicy` 仅拦截 Destructive（删列），其余照常执行。
 
 两处设计取舍：
 
@@ -252,6 +265,8 @@ apply_migrations_with(&db, &plan, MigrateOptions::allow_destructive()).await?;
 > PostgreSQL 现已完整支持并实测。一个值得注意的分歧：「新增 `NOT NULL` 列但无默认值」在 PostgreSQL 与 SQLite 中都会**报错**（除非表为空），而 MySQL 会静默把已有行填成 `''` 或 `0`。
 
 > 已实现：只要计划中包含删列，默认 `apply_migrations` 就会拒绝执行，并返回 `TableError::DestructiveChangesBlocked`；只有 `allow_destructive` 显式授权才会真正执行。端到端测试 `drops_a_column_*` 正是覆盖这一行为——默认应用被拒，授权后才成功并收敛。
+
+> 除上述整体授权外，还提供三层 `RiskPolicy` 开关（全局 / 风险等级 / 具体变更类型），可对任意风险项做 `Allow` / `Block` 的细粒度控制，越具体的层优先级越高。端到端测试 `policy_*` 覆盖其优先级行为。
 
 ## 支持的后端
 
