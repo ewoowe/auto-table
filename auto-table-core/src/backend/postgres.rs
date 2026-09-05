@@ -455,3 +455,139 @@ fn quote_postgres_identifier(name: &str) -> String {
 fn quote_postgres_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
+#[cfg(test)]
+mod tests {
+    use crate::backend::test_helpers::*;
+    use crate::diff::{ColumnAspect, ColumnChange, IndexChange};
+    use crate::parse::PRIMARY_INDEX_NAME;
+    use crate::schema::{ColumnSchema, IndexSchema};
+
+    #[test]
+    fn postgres_changes_one_aspect_per_statement() {
+        // Unlike MySQL, which folds everything into one MODIFY COLUMN
+        let target = ColumnSchema {
+            name: "age".to_string(),
+            col_type: "bigint".to_string(),
+            nullable: false,
+            default: Some("0".to_string()),
+            auto_increment: false,
+        };
+
+        assert_eq!(
+            postgres_plan(
+                vec![ColumnChange::Alter {
+                    name: "age".to_string(),
+                    to: target,
+                    aspects: vec![
+                        ColumnAspect::Type {
+                            from: "integer".to_string(),
+                            to: "bigint".to_string(),
+                        },
+                        ColumnAspect::Nullable {
+                            from: true,
+                            to: false,
+                        },
+                        ColumnAspect::Default {
+                            from: None,
+                            to: Some("0".to_string()),
+                        },
+                    ],
+                }],
+                vec![],
+            ),
+            vec![
+                "ALTER TABLE \"users\" ALTER COLUMN \"age\" TYPE bigint",
+                "ALTER TABLE \"users\" ALTER COLUMN \"age\" SET NOT NULL",
+                "ALTER TABLE \"users\" ALTER COLUMN \"age\" SET DEFAULT '0'",
+            ]
+        );
+    }
+
+    #[test]
+    fn postgres_adds_and_drops_columns() {
+        assert_eq!(
+            postgres_plan(
+                vec![
+                    ColumnChange::Add(column("bio", "varchar")),
+                    ColumnChange::Drop {
+                        name: "legacy".to_string()
+                    },
+                ],
+                vec![],
+            ),
+            vec![
+                "ALTER TABLE \"users\" DROP COLUMN \"legacy\"",
+                "ALTER TABLE \"users\" ADD COLUMN \"bio\" varchar",
+            ]
+        );
+    }
+
+    #[test]
+    fn postgres_drops_a_unique_constraint_not_its_index() {
+        // PostgreSQL refuses to drop an index that a constraint depends on
+        assert_eq!(
+            postgres_plan(
+                vec![],
+                vec![IndexChange::Drop(IndexSchema {
+                    name: "email".to_string(),
+                    columns: vec!["email".to_string()],
+                    unique: true,
+                    primary: false,
+                })],
+            ),
+            vec!["ALTER TABLE \"users\" DROP CONSTRAINT \"users_email_key\""]
+        );
+    }
+
+    #[test]
+    fn postgres_adds_a_unique_constraint() {
+        assert_eq!(
+            postgres_plan(
+                vec![],
+                vec![IndexChange::Add(IndexSchema {
+                    name: "email".to_string(),
+                    columns: vec!["email".to_string()],
+                    unique: true,
+                    primary: false,
+                })],
+            ),
+            vec!["ALTER TABLE \"users\" ADD CONSTRAINT \"users_email_key\" UNIQUE (\"email\")"]
+        );
+    }
+
+    #[test]
+    fn postgres_uses_its_own_primary_key_constraint_name() {
+        assert_eq!(
+            postgres_plan(
+                vec![],
+                vec![IndexChange::Drop(IndexSchema {
+                    name: PRIMARY_INDEX_NAME.to_string(),
+                    columns: vec!["id".to_string()],
+                    unique: true,
+                    primary: true,
+                })],
+            ),
+            vec!["ALTER TABLE \"users\" DROP CONSTRAINT \"users_pkey\""]
+        );
+    }
+
+    #[test]
+    fn postgres_escapes_quotes_in_identifiers_and_literals() {
+        assert_eq!(
+            postgres_plan(
+                vec![ColumnChange::Add(ColumnSchema {
+                    name: "we\"ird".to_string(),
+                    col_type: "varchar".to_string(),
+                    nullable: false,
+                    default: Some("it's".to_string()),
+                    auto_increment: false,
+                })],
+                vec![],
+            ),
+            vec![
+                "ALTER TABLE \"users\" ADD COLUMN \"we\"\"ird\" varchar NOT NULL DEFAULT 'it''s'"
+            ]
+        );
+    }
+
+}

@@ -6,9 +6,9 @@
 //! means adding a module here and nothing else: reading and diffing structures,
 //! planning statements and executing them need no changes.
 
-pub mod mysql;
-pub mod postgres;
-pub mod sqlite;
+mod mysql;
+mod postgres;
+mod sqlite;
 
 pub use mysql::MySql;
 pub use postgres::Postgres;
@@ -27,7 +27,6 @@ use crate::{Backend, TableError};
 /// into something that can do the work. It is an enum rather than a
 /// `Box<dyn Backend>` because [`Backend`] has async methods, which do not sit
 /// behind a trait object without reaching for a macro.
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnyBackend {
     /// MySQL
@@ -127,4 +126,43 @@ impl Backend for AnyBackend {
 /// The backend implementing a given `DbBackend`
 pub fn backend_for(backend: DbBackend) -> Result<AnyBackend, TableError> {
     AnyBackend::for_backend(backend)
+}
+
+#[cfg(test)]
+pub(crate) mod test_helpers {
+    use sea_orm::DbBackend;
+
+    use crate::diff::{ColumnChange, IndexChange, TableDiff};
+    use crate::migrate::plan_table_statements;
+    use crate::schema::ColumnSchema;
+
+    pub fn column(name: &str, col_type: &str) -> ColumnSchema {
+        ColumnSchema {
+            name: name.to_string(),
+            col_type: col_type.to_string(),
+            nullable: true,
+            default: None,
+            auto_increment: false,
+        }
+    }
+
+    pub fn diff(columns: Vec<ColumnChange>, indexes: Vec<IndexChange>) -> TableDiff {
+        TableDiff {
+            table: "users".to_string(),
+            columns,
+            indexes,
+        }
+    }
+
+    pub fn mysql_plan(columns: Vec<ColumnChange>, indexes: Vec<IndexChange>) -> Vec<String> {
+        plan_table_statements(&diff(columns, indexes), DbBackend::MySql).expect("mysql is supported")
+    }
+
+    pub fn sqlite_plan(columns: Vec<ColumnChange>, indexes: Vec<IndexChange>) -> Vec<String> {
+        plan_table_statements(&diff(columns, indexes), DbBackend::Sqlite).expect("sqlite is supported")
+    }
+
+    pub fn postgres_plan(columns: Vec<ColumnChange>, indexes: Vec<IndexChange>) -> Vec<String> {
+        plan_table_statements(&diff(columns, indexes), DbBackend::Postgres).expect("postgres is supported")
+    }
 }

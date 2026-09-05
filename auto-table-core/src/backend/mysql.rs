@@ -383,3 +383,283 @@ fn quote_mysql_identifier(name: &str) -> String {
 fn quote_mysql_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::test_helpers::*;
+    use crate::diff::{ColumnAspect, ColumnChange, IndexChange};
+    use crate::parse::PRIMARY_INDEX_NAME;
+    use crate::schema::{ColumnSchema, IndexSchema};
+
+    #[test]
+    fn mysql_drops_columns_before_adding_them() {
+        assert_eq!(
+            mysql_plan(
+                vec![
+                    ColumnChange::Add(column("email", "varchar(255)")),
+                    ColumnChange::Drop { name: "legacy".to_string() },
+                ],
+                vec![],
+            ),
+            vec![
+                "ALTER TABLE `users` DROP COLUMN `legacy`",
+                "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+            ]
+        );
+    }
+
+    #[test]
+    fn mysql_modify_repeats_the_whole_definition() {
+        let target = ColumnSchema {
+            name: "age".to_string(),
+            col_type: "bigint".to_string(),
+            nullable: false,
+            default: Some("0".to_string()),
+            auto_increment: false,
+        };
+
+        assert_eq!(
+            mysql_plan(
+                vec![ColumnChange::Alter {
+                    name: "age".to_string(),
+                    to: target,
+                    aspects: vec![ColumnAspect::Type {
+                        from: "int".to_string(),
+                        to: "bigint".to_string(),
+                    }],
+                }],
+                vec![],
+            ),
+            vec!["ALTER TABLE `users` MODIFY COLUMN `age` bigint NOT NULL DEFAULT '0'"]
+        );
+    }
+
+    #[test]
+    fn mysql_indexes_are_dropped_first_and_added_last() {
+        assert_eq!(
+            mysql_plan(
+                vec![ColumnChange::Drop { name: "legacy".to_string() }],
+                vec![
+                    IndexChange::Drop(IndexSchema {
+                        name: "email".to_string(),
+                        columns: vec!["email".to_string()],
+                        unique: true,
+                        primary: false,
+                    }),
+                    IndexChange::Add(IndexSchema {
+                        name: "email".to_string(),
+                        columns: vec!["email".to_string()],
+                        unique: true,
+                        primary: false,
+                    }),
+                ],
+            ),
+            vec![
+                "ALTER TABLE `users` DROP INDEX `email`",
+                "ALTER TABLE `users` DROP COLUMN `legacy`",
+                "ALTER TABLE `users` ADD UNIQUE INDEX `email` (`email`)",
+            ]
+        );
+    }
+
+    #[test]
+    fn mysql_primary_key_uses_its_own_syntax() {
+        assert_eq!(
+            mysql_plan(
+                vec![],
+                vec![
+                    IndexChange::Add(IndexSchema {
+                        name: PRIMARY_INDEX_NAME.to_string(),
+                        columns: vec!["id".to_string()],
+                        unique: true,
+                        primary: true,
+                    }),
+                    IndexChange::Drop(IndexSchema {
+                        name: PRIMARY_INDEX_NAME.to_string(),
+                        columns: vec!["id".to_string()],
+                        unique: true,
+                        primary: true,
+                    }),
+                ],
+            ),
+            vec![
+                "ALTER TABLE `users` DROP PRIMARY KEY",
+                "ALTER TABLE `users` ADD PRIMARY KEY (`id`)",
+            ]
+        );
+    }
+
+    #[test]
+    fn mysql_escapes_quotes_in_identifiers_and_literals() {
+        assert_eq!(
+            mysql_plan(
+                vec![ColumnChange::Add(ColumnSchema {
+                    name: "we`ird".to_string(),
+                    col_type: "varchar(255)".to_string(),
+                    nullable: false,
+                    default: Some("it's".to_string()),
+                    auto_increment: false,
+                })],
+                vec![],
+            ),
+            vec!["ALTER TABLE `users` ADD COLUMN `we``ird` varchar(255) NOT NULL DEFAULT 'it''s'"]
+        );
+    }
+
+
+    #[test]
+    fn lowercases_and_collapses_whitespace() {
+        assert_eq!(normalize_mysql_type("  VARCHAR(255)  "), "varchar(255)");
+        assert_eq!(normalize_mysql_type("datetime"), "datetime");
+    }
+
+    #[test]
+    fn strips_integer_display_width() {
+        assert_eq!(normalize_mysql_type("int(11)"), "int");
+        assert_eq!(normalize_mysql_type("BIGINT(20)"), "bigint");
+        assert_eq!(normalize_mysql_type("smallint(6)"), "smallint");
+    }
+
+    #[test]
+    fn maps_tinyint_one_to_bool() {
+        // MySQL stores booleans as tinyint(1) while sea-query emits `bool`
+        assert_eq!(normalize_mysql_type("tinyint(1)"), "bool");
+        assert_eq!(normalize_mysql_type("TINYINT(1)"), "bool");
+        assert_eq!(normalize_mysql_type("boolean"), "bool");
+        // A genuine tinyint keeps its own identity
+        assert_eq!(normalize_mysql_type("tinyint(4)"), "tinyint");
+    }
+
+    #[test]
+    fn drops_default_decimal_precision() {
+        // MySQL always reports the default precision, sea-query omits it
+        assert_eq!(normalize_mysql_type("decimal(10,0)"), "decimal");
+        assert_eq!(normalize_mysql_type("numeric(10,0)"), "numeric");
+        // An explicit precision is meaningful and must be preserved
+        assert_eq!(normalize_mysql_type("decimal(10,2)"), "decimal(10,2)");
+    }
+
+    #[test]
+    fn preserves_meaningful_lengths() {
+        assert_eq!(normalize_mysql_type("varchar(255)"), "varchar(255)");
+        assert_eq!(normalize_mysql_type("char(32)"), "char(32)");
+    }
+
+    #[test]
+    fn sorts_trailing_modifiers() {
+        assert_eq!(
+            normalize_mysql_type("int(10) unsigned zerofill"),
+            "int unsigned zerofill"
+        );
+        // Modifier order should not affect the result
+        assert_eq!(
+            normalize_mysql_type("int(10) zerofill unsigned"),
+            "int unsigned zerofill"
+        );
+    }
+
+    #[test]
+    fn handles_empty_input() {
+        assert_eq!(normalize_mysql_type(""), "");
+        assert_eq!(normalize_mysql_type("   "), "");
+    }
+
+    mod round_trip {
+    use sea_orm::entity::prelude::*;
+    use sea_orm::{DbBackend, Schema};
+
+    use crate::diff::{diff_table, ColumnChange};
+    use crate::parse::parse_create_table;
+    use super::super::normalize_mysql_type;
+    use crate::schema::{ColumnSchema, IndexSchema, TableSchema};
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "round_trip")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = true)]
+        pub id: i32,
+        pub email: String,
+        pub active: bool,
+        pub balance: Decimal,
+        pub legacy: Option<i32>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+
+    /// Builds a column from the raw type as MySQL reports it
+    fn column(name: &str, col_type: &str, nullable: bool, auto_increment: bool) -> ColumnSchema {
+        ColumnSchema {
+            name: name.to_string(),
+            col_type: normalize_mysql_type(col_type),
+            nullable,
+            default: None,
+            auto_increment,
+        }
+    }
+
+    fn primary_key() -> IndexSchema {
+        IndexSchema {
+            name: "PRIMARY".to_string(),
+            columns: vec!["id".to_string()],
+            unique: true,
+            primary: true,
+        }
+    }
+
+    fn expected() -> TableSchema {
+        let backend = DbBackend::MySql;
+        let statement = Schema::new(backend).create_table_from_entity(Entity);
+        parse_create_table(&backend.build(&statement).sql).expect("generated statement parses")
+    }
+
+    #[test]
+    fn a_database_in_sync_produces_no_changes() {
+        // Each type is written the way MySQL reports it and then normalized, so
+        // this is what actually proves the two sides converge:
+        //   `tinyint(1)`   -> `bool`    (a boolean is stored as TINYINT(1))
+        //   `decimal(10,0)`-> `decimal` (MySQL always reports the precision)
+        //   `int(11)`      -> `int`     (the display width carries no meaning)
+        let actual = TableSchema {
+            name: "round_trip".to_string(),
+            columns: vec![
+                column("id", "int", false, true),
+                column("email", "varchar(255)", false, false),
+                column("active", "tinyint(1)", false, false),
+                column("balance", "decimal(10,0)", false, false),
+                column("legacy", "int(11)", true, false),
+            ],
+            indexes: vec![primary_key()],
+        };
+
+        let diff = diff_table(&expected(), &actual);
+
+        assert!(diff.is_empty(), "a synced table must not change: {diff:?}");
+    }
+
+    #[test]
+    fn a_missing_column_is_reported() {
+        let actual = TableSchema {
+            name: "round_trip".to_string(),
+            columns: vec![column("id", "int", false, true)],
+            indexes: vec![primary_key()],
+        };
+
+        let diff = diff_table(&expected(), &actual);
+
+        let added: Vec<&str> = diff
+            .columns
+            .iter()
+            .filter_map(|change| match change {
+                ColumnChange::Add(column) => Some(column.name.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(added.contains(&"email"), "email should be added: {diff:?}");
+        assert!(added.contains(&"active"), "active should be added: {diff:?}");
+    }
+    }
+}

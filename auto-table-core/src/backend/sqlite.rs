@@ -522,3 +522,192 @@ fn quote_sqlite_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::test_helpers::*;
+    use crate::migrate::{plan_table_migration, plan_table_statements};
+    use crate::diff::{ColumnAspect, ColumnChange, IndexChange};
+    use crate::schema::{ColumnSchema, IndexSchema};
+    use sea_orm::DbBackend;
+
+    #[test]
+    fn sqlite_adds_and_drops_columns_directly() {
+        // These need no rebuild, so the statements stay plain ALTERs
+        assert_eq!(
+            sqlite_plan(
+                vec![
+                    ColumnChange::Add(column("bio", "TEXT")),
+                    ColumnChange::Drop { name: "legacy".to_string() },
+                ],
+                vec![],
+            ),
+            vec![
+                "ALTER TABLE \"users\" DROP COLUMN \"legacy\"",
+                "ALTER TABLE \"users\" ADD COLUMN \"bio\" TEXT",
+            ]
+        );
+    }
+
+    #[test]
+    fn sqlite_rebuilds_when_a_column_definition_changes() {
+        let target = ColumnSchema {
+            name: "name".to_string(),
+            col_type: "TEXT".to_string(),
+            nullable: false,
+            default: None,
+            auto_increment: false,
+        };
+        let create_sql = "CREATE TABLE \"users\" ( \"id\" integer NOT NULL PRIMARY KEY AUTOINCREMENT, \"name\" text NOT NULL )";
+
+        let migration = plan_table_migration(
+            &diff(
+                vec![ColumnChange::Alter {
+                    name: "name".to_string(),
+                    to: target,
+                    aspects: vec![ColumnAspect::Nullable { from: true, to: false }],
+                }],
+                vec![],
+            ),
+            DbBackend::Sqlite,
+            create_sql,
+        )
+        .expect("sqlite plan");
+
+        assert!(migration.transactional, "a rebuild must be transactional");
+        assert_eq!(
+            migration.statements,
+            vec![
+                "CREATE TABLE \"users__auto_table_rebuild\" ( \"id\" integer NOT NULL PRIMARY KEY AUTOINCREMENT, \"name\" text NOT NULL )",
+                "INSERT INTO \"users__auto_table_rebuild\" (\"id\", \"name\") SELECT \"id\", \"name\" FROM \"users\"",
+                "DROP TABLE \"users\"",
+                "ALTER TABLE \"users__auto_table_rebuild\" RENAME TO \"users\"",
+            ]
+        );
+    }
+
+    #[test]
+    fn sqlite_rebuild_leaves_dropped_columns_behind() {
+        let create_sql = "CREATE TABLE \"users\" ( \"id\" integer NOT NULL PRIMARY KEY AUTOINCREMENT, \"name\" text NOT NULL )";
+
+        let migration = plan_table_migration(
+            &diff(
+                vec![
+                    ColumnChange::Drop { name: "legacy".to_string() },
+                    ColumnChange::Alter {
+                        name: "name".to_string(),
+                        to: column("name", "TEXT"),
+                        aspects: vec![ColumnAspect::Nullable { from: true, to: false }],
+                    },
+                ],
+                vec![],
+            ),
+            DbBackend::Sqlite,
+            create_sql,
+        )
+        .expect("sqlite plan");
+
+        // `legacy` exists only in the old table, so it is not copied
+        assert!(migration
+            .statements
+            .iter()
+            .any(|sql| sql.contains("SELECT \"id\", \"name\" FROM \"users\"")));
+        assert!(!migration
+            .statements
+            .iter()
+            .any(|sql| sql.contains("legacy\") SELECT")));
+    }
+
+    #[test]
+    fn sqlite_rebuild_fails_without_the_create_statement() {
+        let target = ColumnSchema {
+            name: "name".to_string(),
+            col_type: "TEXT".to_string(),
+            nullable: false,
+            default: None,
+            auto_increment: false,
+        };
+
+        let error = plan_table_statements(
+            &diff(
+                vec![ColumnChange::Alter {
+                    name: "name".to_string(),
+                    to: target,
+                    aspects: vec![ColumnAspect::Nullable { from: true, to: false }],
+                }],
+                vec![],
+            ),
+            DbBackend::Sqlite,
+        )
+        .expect_err("a rebuild needs the CREATE TABLE");
+
+        assert!(matches!(error, TableError::MissingCreateStatement { .. }));
+    }
+
+    #[test]
+    fn sqlite_rebuilds_when_an_index_changes() {
+        // A unique constraint is part of the table definition on SQLite, so it
+        // cannot be added with CREATE INDEX nor removed with DROP INDEX.
+        let create_sql =
+            "CREATE TABLE \"users\" ( \"id\" integer NOT NULL PRIMARY KEY AUTOINCREMENT, \"email\" varchar NOT NULL )";
+
+        let migration = plan_table_migration(
+            &diff(
+                vec![],
+                vec![IndexChange::Add(IndexSchema {
+                    name: "email".to_string(),
+                    columns: vec!["email".to_string()],
+                    unique: true,
+                    primary: false,
+                })],
+            ),
+            DbBackend::Sqlite,
+            create_sql,
+        )
+        .expect("sqlite plan");
+
+        assert!(migration.transactional, "an index change rebuilds the table");
+        assert!(migration
+            .statements
+            .iter()
+            .any(|sql| sql.contains(REBUILD_SUFFIX)));
+    }
+
+    #[test]
+    fn sqlite_affinity_groups_integer_spellings() {
+        // int / integer / bigint all have INTEGER affinity and store the same
+        // values, which is exactly why `i32` -> `i64` must not look like a change
+        for declared in ["integer", "int", "bigint", "INTEGER", "Int"] {
+            assert_eq!(sqlite_type_affinity(declared), "INTEGER", "{declared}");
+        }
+    }
+
+    #[test]
+    fn sqlite_affinity_follows_the_documented_rules() {
+        assert_eq!(sqlite_type_affinity("varchar(255)"), "TEXT");
+        assert_eq!(sqlite_type_affinity("char(32)"), "TEXT");
+        assert_eq!(sqlite_type_affinity("clob"), "TEXT");
+        assert_eq!(sqlite_type_affinity("timestamp_with_timezone_text"), "TEXT");
+
+        assert_eq!(sqlite_type_affinity("blob"), "BLOB");
+        assert_eq!(sqlite_type_affinity(""), "BLOB");
+
+        assert_eq!(sqlite_type_affinity("real"), "REAL");
+        assert_eq!(sqlite_type_affinity("double"), "REAL");
+        assert_eq!(sqlite_type_affinity("real_decimal"), "REAL");
+
+        // Anything else is NUMERIC
+        assert_eq!(sqlite_type_affinity("boolean"), "NUMERIC");
+        assert_eq!(sqlite_type_affinity("decimal"), "NUMERIC");
+    }
+
+    #[test]
+    fn widening_i32_to_i64_is_not_a_difference_on_sqlite() {
+        // Both sides normalize to the same affinity, so no rebuild is triggered
+        assert_eq!(sqlite_type_affinity("int"), sqlite_type_affinity("bigint"));
+        assert_eq!(
+            sqlite_type_affinity("varchar(50)"),
+            sqlite_type_affinity("varchar(255)")
+        );
+    }
+}
