@@ -16,9 +16,12 @@ use sea_orm::{
 use crate::diff::{diff_table, TableDiff};
 use crate::parse::parse_create_table;
 use crate::backend::AnyBackend;
-use crate::risk::{classify, classify_changes, ChangeKind, Risk, RiskAction, RiskPolicy};
+use crate::risk::{classify_changes, ChangeKind, Risk, RiskAction, RiskPolicy};
 use crate::schema::get_table_schema;
-use crate::{get_all_table_statements, get_existing_tables, get_table_name, Backend, TableError};
+use crate::{
+    create_missing_tables, get_all_table_statements, get_existing_tables, get_table_name, Backend,
+    TableError,
+};
 
 /// The statements needed to bring one table in sync
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -33,7 +36,10 @@ pub struct TableMigration {
     /// rebuilding the table. That is a sequence of destructive steps
     /// (`DROP TABLE` among them) which must either all happen or none of them.
     pub transactional: bool,
-    /// How dangerous the change is, so callers can refuse to apply it
+    /// The worst risk anywhere in the table, kept for reporting/diagnostics
+    /// (see [`MigrationPlan::risk`]). Whether each change may actually be
+    /// applied is decided per item from `changes` against a [`RiskPolicy`]; this
+    /// field is never used on its own to gate execution.
     pub risk: Risk,
     /// Every change in the table, paired with its kind and risk, so the plan can
     /// be evaluated against a [`RiskPolicy`] item by item.
@@ -72,7 +78,9 @@ pub struct MigrationPlan {
     /// Whether destructive changes (e.g. dropping a column) may be applied
     ///
     /// `false` by default, so [`apply_migrations`] refuses any plan that
-    /// contains one until [`MigrationPlan::allow_destructive`] opts in.
+    /// contains one until [`MigrationPlan::allow_destructive`] opts in. That
+    /// method is shorthand for setting `risk_policy.levels[Destructive]` to
+    /// `Allow`; an explicit item-level `Block` (L3) still wins.
     pub allow_destructive: bool,
 }
 
@@ -137,13 +145,6 @@ pub struct MigrateOptions {
     pub lock: LockBehavior,
     /// Seconds to wait for the lock; 0 returns immediately
     pub lock_timeout_secs: u32,
-    /// Whether destructive changes (e.g. dropping a column) may be applied
-    ///
-    /// `false` by default. Equivalent to setting
-    /// `risk_policy.levels[Destructive] = RiskAction::Allow`, so an explicit
-    /// item-level `Block` in [`risk_policy`](Self::risk_policy) still wins.
-    /// Prefer configuring `risk_policy` directly for finer control.
-    pub allow_destructive: bool,
     /// Three-layer switch controlling which risk items may be applied.
     ///
     /// `global` applies to every change, `levels` to a risk level, and `items`
@@ -157,7 +158,6 @@ impl Default for MigrateOptions {
         Self {
             lock: LockBehavior::None,
             lock_timeout_secs: 0,
-            allow_destructive: false,
             risk_policy: RiskPolicy::default(),
         }
     }
@@ -169,7 +169,6 @@ impl MigrateOptions {
         Self {
             lock: LockBehavior::Required,
             lock_timeout_secs: timeout_secs,
-            allow_destructive: false,
             risk_policy: RiskPolicy::default(),
         }
     }
@@ -179,7 +178,6 @@ impl MigrateOptions {
         Self {
             lock: LockBehavior::SkipIfLocked,
             lock_timeout_secs: timeout_secs,
-            allow_destructive: false,
             risk_policy: RiskPolicy::default(),
         }
     }
@@ -192,9 +190,15 @@ impl MigrateOptions {
 
     /// Allow destructive changes (such as dropping a column) to be applied
     ///
-    /// Only do this after the plan has been reviewed and approved.
+    /// Shorthand for `self.risk_policy.levels.insert(Risk::Destructive,
+    /// RiskAction::Allow)`. An explicit item-level `Block` in `risk_policy`
+    /// (L3) still wins, because it is more specific than the level rule. Only
+    /// call this after the plan has been reviewed and approved; prefer
+    /// configuring `risk_policy` directly for finer control.
     pub fn allow_destructive(mut self) -> Self {
-        self.allow_destructive = true;
+        self.risk_policy
+            .levels
+            .insert(Risk::Destructive, RiskAction::Allow);
         self
     }
 }
@@ -242,8 +246,13 @@ pub async fn plan_migrations(db: &DatabaseConnection) -> Result<MigrationPlan, T
         }
 
         let mut migration = backend_impl.plan(&diff, &create_sql)?;
-        migration.risk = classify(&diff);
-        migration.changes = classify_changes(&diff);
+        let changes = classify_changes(&diff);
+        migration.risk = changes
+            .iter()
+            .map(|(_, risk)| *risk)
+            .max()
+            .unwrap_or(Risk::Safe);
+        migration.changes = changes;
         tables.push(migration);
     }
 
@@ -296,16 +305,17 @@ pub async fn migrate(
 /// Under a lock the plan is rebuilt once the lock is held, so `plan` only
 /// decides whether migrating is worth attempting at all. Use [`migrate`] to
 /// plan and apply without building a plan twice.
-/// Combines the plan and options into a single risk policy.
+/// Builds the risk policy actually applied: the options' [`RiskPolicy`], with
+/// the `Destructive` level loosened to `Allow` when the plan was opted in via
+/// [`MigrationPlan::allow_destructive`].
 ///
-/// `allow_destructive` (on either the plan or the options) is shorthand for
-/// "allow the `Destructive` level", so it only ever loosens the configured
-/// [`RiskPolicy`]. Because an explicit item-level rule in `items` (L3) outranks
-/// a level rule (L2), an `allow_destructive` call cannot override a policy that
-/// explicitly blocks a specific [`ChangeKind`].
+/// `allow_destructive` is shorthand for "allow the `Destructive` level", so it
+/// only ever loosens the configured policy. Because an explicit item-level rule
+/// in `items` (L3) outranks a level rule (L2), an `allow_destructive` call
+/// cannot override a policy that explicitly blocks a specific [`ChangeKind`].
 fn effective_policy(plan: &MigrationPlan, options: &MigrateOptions) -> RiskPolicy {
     let mut policy = options.risk_policy.clone();
-    if plan.allow_destructive || options.allow_destructive {
+    if plan.allow_destructive {
         policy.levels.insert(Risk::Destructive, RiskAction::Allow);
     }
     policy
@@ -363,6 +373,37 @@ pub async fn apply_migrations_with(
     apply_under_lock(db, options).await
 }
 
+/// What [`ensure_schema`] did, so callers can log or react to the result
+#[derive(Debug, Clone)]
+pub struct SchemaSyncReport {
+    /// Registered tables that already existed and were therefore skipped
+    pub existing_tables: Vec<String>,
+    /// Registered tables that were newly created in this run
+    pub created_tables: Vec<String>,
+    /// Whether the migration step applied any change, and if not why
+    pub migration: MigrationOutcome,
+}
+
+/// Creates every missing registered table, then applies the schema migrations.
+///
+/// This is the one entry point to call at startup: it both provisions tables
+/// that have never existed (via [`create_missing_tables`]) and brings existing
+/// ones in line with the entities (via [`migrate`]). The same [`MigrateOptions`]
+/// (lock behaviour, risk policy, …) governs the migration half; table creation
+/// never touches existing data, so it is unaffected by the risk policy.
+pub async fn ensure_schema(
+    db: &DatabaseConnection,
+    options: MigrateOptions,
+) -> Result<SchemaSyncReport, TableError> {
+    let report = create_missing_tables(db).await?;
+    let migration = migrate(db, options).await?;
+    Ok(SchemaSyncReport {
+        existing_tables: report.existing_tables,
+        created_tables: report.created_tables,
+        migration,
+    })
+}
+
 /// Turns the diff of one table into the statements that apply it
 ///
 /// Use [`plan_table_migration`] when the target is SQLite: changing a column
@@ -384,8 +425,13 @@ pub fn plan_table_migration(
     create_sql: &str,
 ) -> Result<TableMigration, TableError> {
     let mut migration = AnyBackend::for_backend(backend)?.plan(diff, create_sql)?;
-    migration.risk = classify(diff);
-    migration.changes = classify_changes(diff);
+    let changes = classify_changes(diff);
+    migration.risk = changes
+        .iter()
+        .map(|(_, risk)| *risk)
+        .max()
+        .unwrap_or(Risk::Safe);
+    migration.changes = changes;
     Ok(migration)
 }
 
@@ -566,12 +612,6 @@ async fn apply_in_transaction(
 
     outcome
 }
-
-
-// ---------------------------------------------------------------------------
-// PostgreSQL
-// ---------------------------------------------------------------------------
-
 
 #[cfg(test)]
 mod tests {

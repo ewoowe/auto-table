@@ -385,9 +385,7 @@ fn has_word(upper: &str, word: &str) -> bool {
 fn split_first_token(s: &str) -> Option<(&str, &str)> {
     let s = s.trim();
     let mut bytes = s.bytes();
-    let Some(first) = bytes.next() else {
-        return None;
-    };
+    let first = bytes.next()?;
 
     if matches!(first, b'`' | b'"' | b'\'') {
         let close = first as char;

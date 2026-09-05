@@ -298,9 +298,6 @@ async fn acquire_sqlite_lock(
     Ok(true)
 }
 
-/// Key for PostgreSQL's advisory lock
-///
-
 /// Suffix used for the replacement table while a table is being rebuilt
 pub const REBUILD_SUFFIX: &str = "__auto_table_rebuild";
 

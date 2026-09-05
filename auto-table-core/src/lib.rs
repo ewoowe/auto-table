@@ -33,9 +33,9 @@ pub use diff::{
     diff_table, ColumnAspect, ColumnChange, IndexChange, TableDiff,
 };
 pub use migrate::{
-    apply_migrations, apply_migrations_with, migrate, plan_migrations, plan_table_migration,
-    plan_table_statements, LockBehavior, MigrateOptions, MigrationOutcome, MigrationPlan,
-    TableMigration,
+    apply_migrations, apply_migrations_with, ensure_schema, migrate, plan_migrations,
+    plan_table_migration, plan_table_statements, LockBehavior, MigrateOptions, MigrationOutcome,
+    MigrationPlan, SchemaSyncReport, TableMigration,
 };
 pub use parse::{parse_create_table, ParseError, PRIMARY_INDEX_NAME};
 pub use risk::{classify, ChangeKind, Risk, RiskAction, RiskPolicy};
@@ -245,7 +245,7 @@ pub async fn create_missing_tables(
 // Re-export the procedural macros so users only need to depend on the
 // `auto_table_core` crate to use both `#[auto_table]` and `#[auto_create]`
 // (no separate dependency on `auto_table_derive` required).
-pub use auto_table_derive::{auto_create, auto_table};
+pub use auto_table_derive::{auto_create, auto_migrate, auto_table};
 
 /// Everything a database backend has to provide
 ///

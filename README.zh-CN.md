@@ -2,7 +2,7 @@
 
 [English](README.md) | [中文文档](README.zh-CN.md)
 
-基于 [SeaORM](https://crates.io/crates/sea-orm) 的建表与迁移工具库。通过属性宏在编译期收集所有实体，在应用启动时自动创建缺失的表，并可将已存在的表结构与实体定义对齐（支持 MySQL 与 SQLite）。
+基于 [SeaORM](https://crates.io/crates/sea-orm) 的建表与迁移工具库。通过属性宏在编译期收集所有实体，在应用启动时自动创建缺失的表，并可将已存在的表结构与实体定义对齐（支持 MySQL、PostgreSQL 与 SQLite）。
 
 ## 组成
 
@@ -10,7 +10,7 @@
 
 | Crate | 说明 |
 | --- | --- |
-| [`auto-table-core`](auto-table-core) | 核心库，提供 `#[auto_table]` / `#[auto_create]` 宏的运行时支持、表结构读取与比对、迁移计划与执行 |
+| [`auto-table-core`](auto-table-core) | 核心库，提供 `#[auto_table]` / `#[auto_create]` / `#[auto_migrate]` 宏的运行时支持、表结构读取与比对、迁移计划与执行 |
 | [`auto-table-derive`](auto-table-derive) | 过程宏实现（proc-macro） |
 
 > 通常你只需依赖 `auto-table-core`，它已通过 `pub use` 重新导出了两个过程宏。
@@ -95,6 +95,18 @@ for sql in plan.statements() {
 auto_table_core::apply_migrations(&db, &plan).await?;
 ```
 
+也可以像 `#[auto_create]` 那样，用 `#[auto_migrate(db)]` 属性宏把迁移注入到数据库初始化函数里：宏会找到 `let db = ...` 绑定，并紧接着以默认选项调用 `migrate`，把 `MigrationOutcome` 绑到 `__auto_table_migration`。需要自定义 `MigrateOptions`（如加锁或放行删列）时，可传第二个参数：`#[auto_migrate(db, MigrateOptions::locked(10))]`：
+
+```rust
+#[auto_migrate(db)]
+pub async fn init_pool(database_url: &str) -> anyhow::Result<()> {
+    let db = Database::connect(database_url).await?;
+    db.ping().await?;          // 此处迁移已经跑完
+    DB.set(db).expect("...");
+    Ok(())
+}
+```
+
 迁移是**声明式**的：每次都拿实体定义与数据库当前结构做 diff，而非按版本号依次执行。因此它是幂等的——执行完再生成一次计划必然为空；中途失败也可在修复数据后重跑，已完成的变更不会重复。
 
 MySQL、SQLite 与 PostgreSQL 三个后端均支持迁移。三者的语句生成方式不同，主要差异见下文各节。
@@ -121,7 +133,7 @@ migrate(&db, MigrateOptions::skip_if_locked(0)).await?;
 
 - **MySQL** 使用命名锁 `GET_LOCK`。它是**会话级**的，因此整个迁移在单个事务内执行以固定连接，否则锁形同虚设。锁名附带数据库名，同一实例上的不同库互不阻塞。
 - **PostgreSQL** 使用 `pg_advisory_lock`（在一个固定 key 上取锁）。它同样是会话级的，因此迁移也在单个事务内执行以保住锁；非阻塞的 `skip` 模式使用 `pg_try_advisory_lock`。
-- **SQLite** 没有命名锁，依赖其自身的写锁；加锁只是额外设置一个 `busy_timeout`，让并发实例排队而不是立刻收到 `SQLITE_BUSY`。
+- **SQLite** 没有命名锁，依赖其自身的写锁；加锁只是额外设置一个 `busy_timeout`，让并发实例排队而不是立刻收到 `SQLITE_BUSY`。但有一点要注意：SQLite 连接池默认只有 1 个连接，而 `apply_under_lock` 在拿到锁之后还会重新规划、需要第二条连接——因此用 `locked` / `skip_if_locked` 时要把连接池调到至少 2 条（如 `sea_orm::ConnectOptions::new(url).max_connections(2)`）。`sqlite::memory:` 因每个连接都是独立的私有库，永远无法使用锁。
 
 无论哪个后端，**拿到锁之后都会重新生成一次计划**：等待锁的这段时间里另一个实例可能已经迁移完毕，重放过期计划只会失败。
 
@@ -130,7 +142,7 @@ migrate(&db, MigrateOptions::skip_if_locked(0)).await?;
 - [`get_table_schema`](auto-table-core/src/schema.rs) —— 读取某张表当前的结构
 - [`parse_create_table`](auto-table-core/src/parse.rs) —— 把实体生成的 `CREATE TABLE` 解析成同样的结构
 - [`diff_table`](auto-table-core/src/diff.rs) —— 比对两份结构，得到变更清单
-- [`plan_table_migration`](auto-table-core/src/migrate.rs) —— 把单张表的变更清单变成语句（MySQL 与 SQLite 均适用）
+- [`plan_table_migration`](auto-table-core/src/migrate.rs) —— 把单张表的变更清单变成语句（MySQL、SQLite 与 PostgreSQL 均适用）
 
 #### 迁移对已有数据的影响
 
@@ -257,6 +269,8 @@ apply_migrations_with(&db, &plan, MigrateOptions::default().with_risk_policy(pol
 
 三层开关的生效优先级为 **L3（具体类型）> L2（风险等级）> L1（全局）**。`allow_destructive()` 是"放行 Destructive 等级"的简写，因此仍会被 L3 上对该具体变更类型的显式 `Block` 覆盖。默认 `RiskPolicy` 仅拦截 Destructive（删列），其余照常执行。
 
+若想用一次调用同时"补建缺失表 **并** 迁移已有表"，可使用 `ensure_schema`：它先跑 `create_missing_tables`、再跑 `migrate`，迁移一半沿用同一套 `MigrateOptions`（锁行为、风险策略等）控制。
+
 两处设计取舍：
 
 - **先检查、后执行**：在跑任何语句之前先扫描整个计划，发现未授权的破坏性变更就立即报错、一条都不执行。MySQL 的 DDL 不能回滚，"执行到一半才发现危险"会把数据库留在半成品状态；对 SQLite 而言也能省下一次白白的大表重建。
@@ -283,7 +297,7 @@ apply_migrations_with(&db, &plan, MigrateOptions::default().with_risk_policy(pol
 ## 路线图
 
 - [x] **数据库迁移（migration）** — 三个后端均可用（见「4. 迁移已存在的表」与「PostgreSQL 的迁移场景」），并发安全已通过各后端的原生锁实现：MySQL `GET_LOCK`、SQLite 写锁 + `busy_timeout`、PostgreSQL `pg_advisory_lock`（见「5. 并发安全」）；拿到锁后会重新生成计划，绝不重放过期计划。
-  - 危险操作分级（见「危险操作分级」设计草案）尚未强制：删除列仍是破坏性操作，要等拟定的授权 API 落地后才有保护。
+  - 危险操作分级（见「危险操作分级」）已强制：`apply_migrations` 默认拒绝任何含删列的计划，除非设置 `allow_destructive`；三层 `RiskPolicy`（全局 / 风险等级 / 具体变更类型）可对任一风险项做 `Allow`/`Block`，越具体的层优先级越高。
 - [x] **SQLite 迁移（含重建表）** — SQLite 不支持 `MODIFY COLUMN`，故列定义变更与索引/约束变更都走「建新表 → 拷贝数据 → 删旧表 → 重命名」流程，在单个事务内完成、失败自动回滚（详见「SQLite 的迁移场景」）
 - [ ] 迁移回滚 — 本库迁移是声明式的（每次对比当前状态与目标状态），难以自动生成 down：`DROP COLUMN` 后数据已丢失，且 MySQL 的 DDL 不支持在事务中回滚（SQLite 则可以，已实测）。计划先落地「失败时按逆操作尽力回滚」，有损步骤明确报错而非静默继续
 - [x] 更细粒度的后端特性开关（按需启用 MySQL / PostgreSQL / SQLite）
@@ -292,10 +306,10 @@ apply_migrations_with(&db, &plan, MigrateOptions::default().with_risk_policy(pol
 
 本库的测试分两层，覆盖三个后端上的每一种迁移场景：
 
-- **单元测试** 紧挨计划器放在 `auto-table-core/src/backend/{mysql,postgres,sqlite}.rs`。它们逐一断言每个 `IndexChange` / `ColumnAspect` 生成的确切 DDL，以及类型归一与语句排序——无需数据库。（72 个测试）
-- **端到端测试** 在 `auto-table-core/tests/{mysql,pg,sqlite}_e2e.rs`，跑通完整链路——读取线上结构 → 与实体做 diff → 生成计划 → 执行真实 DDL → 再计划一次应得到空计划。它们分别对接真实的 MySQL 8、PostgreSQL 18 与内置 SQLite。（19 + 15 + 11 = 45 个测试）
+- **单元测试** 紧挨计划器放在 `auto-table-core/src/backend/{mysql,postgres,sqlite}.rs`。它们逐一断言每个 `IndexChange` / `ColumnAspect` 生成的确切 DDL，以及类型归一与语句排序——无需数据库。（84 个测试）
+- **端到端测试** 在 `auto-table-core/tests/{mysql,pg,sqlite}_e2e.rs`，跑通完整链路——读取线上结构 → 与实体做 diff → 生成计划 → 执行真实 DDL → 再计划一次应得到空计划。它们分别对接真实的 MySQL 8、PostgreSQL 18 与内置 SQLite。（22 + 18 + 14 = 54 个测试）
 
-设置好 `AUTO_TABLE_TEST_DATABASE_URL` / `AUTO_TABLE_TEST_POSTGRES_URL` 后执行 `cargo test -p auto-table-core --all-features`，可运行全部 **117 个测试**，目前**全部通过、零告警**。
+设置好 `AUTO_TABLE_TEST_DATABASE_URL` / `AUTO_TABLE_TEST_POSTGRES_URL` 后执行 `cargo test -p auto-table-core --all-features`，可运行全部 **138 个测试**，目前**全部通过**。
 
 ### 场景矩阵
 

@@ -151,6 +151,139 @@ pub fn auto_create(attr: TokenStream, item: TokenStream) -> TokenStream {
     expanded.into()
 }
 
+/// Attribute macro that injects automatic schema migration.
+///
+/// Apply it to a function that initializes the database. The argument is the
+/// name of the `DatabaseConnection` variable in the function body. The macro
+/// locates the `let <db> = ...` binding and injects the migration call
+/// immediately after it, so the migration runs right after the connection is
+/// established and before `db` is moved. This does not depend on how many
+/// trailing statements the function body has.
+///
+/// # Example
+/// ```ignore
+/// #[auto_migrate(db)]
+/// pub async fn init_pool(database_url: &str) -> anyhow::Result<()> {
+///     let db = Database::connect(database_url).await?;
+///     db.ping().await?;
+///     DB.set(db).expect("...");
+///     Ok(())
+/// }
+/// ```
+///
+/// Equivalent to writing manually:
+/// ```ignore
+/// pub async fn init_pool(database_url: &str) -> anyhow::Result<()> {
+///     let db = Database::connect(database_url).await?;
+///     let __auto_table_migration = migrate_tables(&db).await?;  // injection point
+///     db.ping().await?;
+///     DB.set(db).expect("...");
+///     Ok(())
+/// }
+///
+/// async fn migrate_tables(
+///     db: &sea_orm::DatabaseConnection,
+///     options: auto_table_core::MigrateOptions,
+/// ) -> Result<auto_table_core::MigrationOutcome, auto_table_core::TableError> {
+///     auto_table_core::migrate(db, options).await
+/// }
+/// ```
+///
+/// The migration logic is implemented in [`auto_table_core::migrate`], which
+/// performs no logging and instead returns the [`auto_table_core::MigrationOutcome`]
+/// (whether the plan was applied or skipped). The injected statement binds that
+/// outcome to a fixed local variable named `__auto_table_migration`; its name
+/// starts with an underscore, so it does not trigger an unused-variable warning
+/// if you do not consume it.
+///
+/// By default (no second argument) the migration refuses any destructive change
+/// (e.g. dropping a column) and returns
+/// `auto_table_core::TableError::DestructiveChangesBlocked`. To allow it, pass
+/// options as the second macro argument, e.g.
+/// `#[auto_migrate(db, MigrateOptions::default().allow_destructive())]`, or call
+/// [`auto_table_core::migrate`] / [`auto_table_core::ensure_schema`] directly.
+/// Arguments for [`auto_migrate`]: `<db_var>` or `<db_var>, <options_expr>`.
+struct AutoMigrateArgs {
+    db: syn::Ident,
+    options: Option<syn::Expr>,
+}
+
+impl syn::parse::Parse for AutoMigrateArgs {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let db: syn::Ident = input.parse()?;
+        let options = if input.peek(syn::Token![,]) {
+            input.parse::<syn::Token![,]>()?;
+            Some(input.parse::<syn::Expr>()?)
+        } else {
+            None
+        };
+        Ok(AutoMigrateArgs { db, options })
+    }
+}
+
+#[proc_macro_attribute]
+pub fn auto_migrate(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(attr as AutoMigrateArgs);
+    let db_var = args.db;
+    let options = match args.options {
+        Some(expr) => quote!(#expr),
+        None => quote!(auto_table_core::MigrateOptions::default()),
+    };
+    let mut input = parse_macro_input!(item as ItemFn);
+
+    let fn_name = &input.sig.ident;
+    // Prefix the generated helper function name to avoid collisions
+    let migrate_fn = format_ident!("__auto_migrate_tables_{}", fn_name);
+
+    let call_stmt: syn::Stmt = syn::parse_quote! {
+        let __auto_table_migration = #migrate_fn(&#db_var, #options).await?;
+    };
+
+    // Inject the call right after the `let <db_var> = ...` binding, instead of
+    // guessing a fixed number of trailing statements. The outcome is then in
+    // scope for the rest of the function body.
+    let stmts = &input.block.stmts;
+    let mut new_stmts: Vec<syn::Stmt> = Vec::with_capacity(stmts.len() + 1);
+
+    let mut inserted = false;
+    for stmt in stmts.iter() {
+        new_stmts.push(stmt.clone());
+        if !inserted && is_db_binding(stmt, &db_var) {
+            new_stmts.push(call_stmt.clone());
+            inserted = true;
+        }
+    }
+
+    // Fallback: no `let <db_var> = ...` binding found (e.g. `db` is a function
+    // parameter). Inject at the very beginning of the body.
+    if !inserted {
+        new_stmts.insert(0, call_stmt);
+    }
+
+    input.block.stmts = new_stmts;
+
+    let expanded = quote! {
+        #input
+
+        /// Auto-generated schema-migration function
+        ///
+        /// Delegates to `auto_table_core::migrate` with the caller-supplied
+        /// options (or `MigrateOptions::default()`), returning the
+        /// `auto_table_core::MigrationOutcome` (Applied or Skipped). Failures
+        /// are reported as the precise library-level error
+        /// `auto_table_core::TableError`, which the caller (application layer) can
+        /// box into an anyhow error via `?`.
+        async fn #migrate_fn(
+            db: &sea_orm::DatabaseConnection,
+            options: auto_table_core::MigrateOptions,
+        ) -> Result<auto_table_core::MigrationOutcome, auto_table_core::TableError> {
+            auto_table_core::migrate(db, options).await
+        }
+    };
+
+    expanded.into()
+}
+
 /// Returns `true` if `stmt` is a `let` binding whose pattern binds exactly the
 /// identifier `var` (either directly as `let var = ...` or with a type
 /// annotation as `let var: Type = ...`).

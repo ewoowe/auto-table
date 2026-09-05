@@ -2,7 +2,7 @@
 
 [English](README.md) | [中文文档](README.zh-CN.md)
 
-A table-creation and migration toolkit built on [SeaORM](https://crates.io/crates/sea-orm). It collects all entities at compile time via attribute macros, creates missing tables at application startup, and can bring existing tables back in line with the entity definitions (MySQL and SQLite).
+A table-creation and migration toolkit built on [SeaORM](https://crates.io/crates/sea-orm). It collects all entities at compile time via attribute macros, creates missing tables at application startup, and can bring existing tables back in line with the entity definitions (MySQL, PostgreSQL and SQLite).
 
 ## Crates
 
@@ -10,7 +10,7 @@ This workspace contains two crates:
 
 | Crate | Description |
 | --- | --- |
-| [`auto-table-core`](auto-table-core) | Core library: runtime support for the `#[auto_table]` / `#[auto_create]` macros, schema reading and diffing, migration planning and execution |
+| [`auto-table-core`](auto-table-core) | Core library: runtime support for the `#[auto_table]` / `#[auto_create]` / `#[auto_migrate]` macros, schema reading and diffing, migration planning and execution |
 | [`auto-table-derive`](auto-table-derive) | Procedural macro implementation |
 
 > In most cases you only need to depend on `auto-table-core`; it re-exports both procedural macros via `pub use`.
@@ -96,6 +96,23 @@ for sql in plan.statements() {
 auto_table_core::apply_migrations(&db, &plan).await?;
 ```
 
+Or inject the migration into your database-initialization function with the
+`#[auto_migrate(db)]` attribute macro — the analogue of `#[auto_create]` for
+migrations. It locates the `let db = ...` binding and runs `migrate` with
+default options right after it, binding the `MigrationOutcome` to
+`__auto_table_migration`. Pass a second argument for custom `MigrateOptions`,
+e.g. `#[auto_migrate(db, MigrateOptions::locked(10).with_risk_policy(policy))]`:
+
+```rust
+#[auto_migrate(db)]
+pub async fn init_pool(database_url: &str) -> anyhow::Result<()> {
+    let db = Database::connect(database_url).await?;
+    db.ping().await?;          // the migration has already run here
+    DB.set(db).expect("...");
+    Ok(())
+}
+```
+
 Migrations are **declarative**: every run diffs the entity definition against
 the current database structure instead of replaying numbered steps. That makes
 them idempotent — planning again after applying always yields nothing — and it
@@ -141,7 +158,12 @@ Two notes on how it works:
   effective; `pg_try_advisory_lock` backs the non-blocking `skip` mode.
 - **SQLite** has no named locks and relies on its own write lock; taking the
   lock only adds a `busy_timeout` so a concurrent instance queues instead of
-  failing immediately with `SQLITE_BUSY`.
+  failing immediately with `SQLITE_BUSY`. One caveat: SQLite's connection pool
+  defaults to a single connection, but `apply_under_lock` re-plans after taking
+  the lock and needs a second one — so set the pool to at least two connections
+  (e.g. `sea_orm::ConnectOptions::new(url).max_connections(2)`) when using
+  `locked` / `skip_if_locked` on SQLite. `sqlite::memory:` cannot use the lock
+  at all, since each connection is a separate private database.
 
 On all three backends the plan is **rebuilt after the lock is taken**: while waiting
 for the lock, another instance may well have finished migrating, and replaying a
@@ -152,7 +174,7 @@ For finer-grained control the building blocks are public as well:
 - [`get_table_schema`](auto-table-core/src/schema.rs) — read the current structure of a table
 - [`parse_create_table`](auto-table-core/src/parse.rs) — parse the entity's `CREATE TABLE` into the same structure
 - [`diff_table`](auto-table-core/src/diff.rs) — compare two structures and get the list of changes
-- [`plan_table_migration`](auto-table-core/src/migrate.rs) — turn the changes of one table into statements (MySQL and SQLite)
+- [`plan_table_migration`](auto-table-core/src/migrate.rs) — turn the changes of one table into statements (MySQL, SQLite and PostgreSQL)
 
 #### What happens to existing rows
 
@@ -305,6 +327,11 @@ apply_migrations_with(&db, &plan, MigrateOptions::default().with_risk_policy(pol
 
 The three layers take effect in priority order **L3 (concrete kind) > L2 (risk level) > L1 (global)**. `allow_destructive()` is just shorthand for allowing the `Destructive` level, so an explicit `Block` on that concrete change at L3 still overrides it. The default `RiskPolicy` blocks only `Destructive` (dropping a column) and runs everything else.
 
+For a single startup call that both creates any missing tables **and** migrates the
+existing ones, use `ensure_schema`: it runs `create_missing_tables` and then `migrate`
+with the same `MigrateOptions` (lock behaviour, risk policy, …) governing the migration
+half.
+
 Two deliberate trade-offs:
 
 - **Check first, then run.** The whole plan is scanned before any statement
@@ -355,10 +382,10 @@ The core library exposes a precise [`auto_table_core::TableError`](auto-table-co
 
 The library is verified by two layers that together exercise every migration scenario on all three backends:
 
-- **Unit tests** live next to the planner in `auto-table-core/src/backend/{mysql,postgres,sqlite}.rs`. They assert the exact DDL each `IndexChange` / `ColumnAspect` produces, plus type normalization and statement ordering — no database required. (72 tests.)
-- **End-to-end tests** in `auto-table-core/tests/{mysql,pg,sqlite}_e2e.rs` drive the whole path — read the live schema → diff against the entity → plan → apply real DDL → assert the plan is empty on the next run. They run against a live MySQL 8, PostgreSQL 18 and the bundled SQLite. (19 + 15 + 11 = 45 tests.)
+- **Unit tests** live next to the planner in `auto-table-core/src/backend/{mysql,postgres,sqlite}.rs`. They assert the exact DDL each `IndexChange` / `ColumnAspect` produces, plus type normalization and statement ordering — no database required. (84 tests.)
+- **End-to-end tests** in `auto-table-core/tests/{mysql,pg,sqlite}_e2e.rs` drive the whole path — read the live schema → diff against the entity → plan → apply real DDL → assert the plan is empty on the next run. They run against a live MySQL 8, PostgreSQL 18 and the bundled SQLite. (22 + 18 + 14 = 54 tests.)
 
-`cargo test -p auto-table-core --all-features` with `AUTO_TABLE_TEST_DATABASE_URL` / `AUTO_TABLE_TEST_POSTGRES_URL` set runs all **117 tests**; the suite currently passes with **zero warnings**.
+`cargo test -p auto-table-core --all-features` with `AUTO_TABLE_TEST_DATABASE_URL` / `AUTO_TABLE_TEST_POSTGRES_URL` set runs all **138 tests**; the suite currently passes.
 
 ### Scenario matrix
 
