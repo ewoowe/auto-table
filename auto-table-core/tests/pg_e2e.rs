@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 
 use auto_table_core::{
     apply_migrations, apply_migrations_with, create_missing_tables, migrate, plan_migrations,
-    ChangeKind, MigrateOptions, MigrationOutcome, MigrationPlan, Risk, RiskAction, RiskPolicy,
+    ChangeKind, MigrateOptions, MigrationOutcome, Risk, RiskAction, RiskPolicy,
     TableError,
 };
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, TransactionTrait};
@@ -57,63 +57,14 @@ async fn connect() -> DatabaseConnection {
         })
 }
 
-fn statements_for<'a>(plan: &'a MigrationPlan, table: &str) -> Vec<&'a str> {
-    plan.tables
-        .iter()
-        .find(|migration| migration.table == table)
-        .map(|migration| migration.statements.iter().map(String::as_str).collect())
-        .unwrap_or_default()
-}
+mod common;
 
-/// Recreates a table with a legacy definition
+/// Identifier quote character for this backend (`"` for SQLite/PostgreSQL,
+/// `` ` `` for MySQL).
+const QUOTE: char = '"';
+
 async fn create_legacy_table(db: &DatabaseConnection, table: &str, definition: &str) {
-    db.execute_unprepared(&format!("DROP TABLE IF EXISTS \"{table}\""))
-        .await
-        .expect("drop the table");
-    db.execute_unprepared(&format!("CREATE TABLE \"{table}\" ({definition})"))
-        .await
-        .expect("create the legacy table");
-}
-
-/// Plans, checks the statements, applies them, then checks the plan is empty
-async fn check_and_apply(db: &DatabaseConnection, table: &str, expected: &[&str]) {
-    let plan = plan_migrations(db).await.expect("plan the migration");
-    let statements = statements_for(&plan, table);
-    assert_eq!(statements, expected, "unexpected statements for `{table}`");
-
-    apply_migrations(db, &plan).await.expect("apply the plan");
-
-    let plan = plan_migrations(db).await.expect("plan again after applying");
-    assert!(
-        statements_for(&plan, table).is_empty(),
-        "`{table}` is not idempotent, it still plans: {:?}",
-        statements_for(&plan, table)
-    );
-}
-
-/// Like [`check_and_apply`] but for a destructive plan: applying it without
-/// approval must be refused, and only `allow_destructive` lets it run and converge.
-async fn check_and_apply_destructive(db: &DatabaseConnection, table: &str, expected: &[&str]) {
-    let plan = plan_migrations(db).await.expect("plan the migration");
-    let statements = statements_for(&plan, table);
-    assert_eq!(statements, expected, "unexpected statements for `{table}`");
-
-    let blocked = apply_migrations(db, &plan).await;
-    assert!(
-        matches!(blocked, Err(TableError::DestructiveChangesBlocked { .. })),
-        "destructive change must be blocked by default, got {blocked:?}"
-    );
-
-    apply_migrations(db, &plan.allow_destructive())
-        .await
-        .expect("apply the plan after allowing destructive changes");
-
-    let plan = plan_migrations(db).await.expect("plan again after applying");
-    assert!(
-        statements_for(&plan, table).is_empty(),
-        "`{table}` is not idempotent, it still plans: {:?}",
-        statements_for(&plan, table)
-    );
+    common::create_legacy_table(db, table, QUOTE, definition).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -189,13 +140,13 @@ mod drop_column {
 }
 
 /// `score` widens from `integer` to `bigint`
-mod widen {
+mod change_type {
     use auto_table_core::auto_table;
     use sea_orm::entity::prelude::*;
 
     #[auto_table]
     #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
-    #[sea_orm(table_name = "e2e_pg_widen")]
+    #[sea_orm(table_name = "e2e_pg_change_type")]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = true)]
         pub id: i32,
@@ -290,9 +241,9 @@ async fn a_table_created_by_the_library_is_already_in_sync() {
     // as character varying, stores `decimal` as numeric and spells `bool` as
     // boolean, and none of that may come back as a difference.
     assert!(
-        statements_for(&plan, "e2e_pg_baseline").is_empty(),
+        common::statements_for(&plan, "e2e_pg_baseline").is_empty(),
         "a table the library just created must not change, got: {:?}",
-        statements_for(&plan, "e2e_pg_baseline")
+        common::statements_for(&plan, "e2e_pg_baseline")
     );
 }
 
@@ -308,7 +259,7 @@ async fn a_table_that_does_not_exist_is_not_migrated() {
     let plan = plan_migrations(&db).await.expect("plan the migration");
 
     assert!(
-        statements_for(&plan, "e2e_pg_baseline").is_empty(),
+        common::statements_for(&plan, "e2e_pg_baseline").is_empty(),
         "a missing table must be left to table creation"
     );
 }
@@ -325,7 +276,7 @@ async fn adds_a_column_missing_from_the_table() {
     )
     .await;
 
-    check_and_apply(
+    common::check_and_apply(
         &db,
         "e2e_pg_add_column",
         &["ALTER TABLE \"e2e_pg_add_column\" ADD COLUMN \"bio\" varchar"],
@@ -345,7 +296,7 @@ async fn drops_a_column_the_entity_no_longer_declares() {
     )
     .await;
 
-    check_and_apply_destructive(
+    common::check_and_apply_destructive(
         &db,
         "e2e_pg_drop_column",
         &["ALTER TABLE \"e2e_pg_drop_column\" DROP COLUMN \"obsolete\""],
@@ -360,15 +311,15 @@ async fn widens_a_column_type() {
 
     create_legacy_table(
         &db,
-        "e2e_pg_widen",
+        "e2e_pg_change_type",
         "\"id\" integer GENERATED BY DEFAULT AS IDENTITY NOT NULL PRIMARY KEY, \"score\" integer NOT NULL",
     )
     .await;
 
-    check_and_apply(
+    common::check_and_apply(
         &db,
-        "e2e_pg_widen",
-        &["ALTER TABLE \"e2e_pg_widen\" ALTER COLUMN \"score\" TYPE bigint"],
+        "e2e_pg_change_type",
+        &["ALTER TABLE \"e2e_pg_change_type\" ALTER COLUMN \"score\" TYPE bigint"],
     )
     .await;
 }
@@ -385,7 +336,7 @@ async fn makes_a_nullable_column_required() {
     )
     .await;
 
-    check_and_apply(
+    common::check_and_apply(
         &db,
         "e2e_pg_not_null",
         &["ALTER TABLE \"e2e_pg_not_null\" ALTER COLUMN \"name\" SET NOT NULL"],
@@ -405,7 +356,7 @@ async fn adds_a_default_value() {
     )
     .await;
 
-    check_and_apply(
+    common::check_and_apply(
         &db,
         "e2e_pg_default",
         &["ALTER TABLE \"e2e_pg_default\" ALTER COLUMN \"role\" SET DEFAULT 'member'"],
@@ -426,7 +377,7 @@ async fn adds_a_missing_unique_constraint() {
     .await;
 
     // PostgreSQL names a unique constraint <table>_<column>_key
-    check_and_apply(
+    common::check_and_apply(
         &db,
         "e2e_pg_add_index",
         &["ALTER TABLE \"e2e_pg_add_index\" ADD CONSTRAINT \"e2e_pg_add_index_email_key\" UNIQUE (\"email\")"],
@@ -447,7 +398,7 @@ async fn a_second_instance_skips_while_the_lock_is_held() {
     )
     .await;
     assert!(
-        !statements_for(&plan_migrations(&db).await.expect("plan"), "e2e_pg_add_column").is_empty(),
+        !common::statements_for(&plan_migrations(&db).await.expect("plan"), "e2e_pg_add_column").is_empty(),
         "there should be something to migrate"
     );
 
@@ -493,7 +444,7 @@ async fn a_second_instance_skips_while_the_lock_is_held() {
     assert_eq!(outcome, MigrationOutcome::Applied);
 
     assert!(
-        statements_for(&plan_migrations(&db).await.expect("plan"), "e2e_pg_add_column").is_empty(),
+        common::statements_for(&plan_migrations(&db).await.expect("plan"), "e2e_pg_add_column").is_empty(),
         "the migration must have been applied"
     );
 }
@@ -523,13 +474,13 @@ async fn a_fully_migrated_database_plans_nothing() {
 // --- enriched scenarios: every migration kind against a real server ---
 
 /// The table no longer wants the plain index on `bio`
-mod drop_plain_index {
+mod drop_index {
     use auto_table_core::auto_table;
     use sea_orm::entity::prelude::*;
 
     #[auto_table]
     #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
-    #[sea_orm(table_name = "e2e_pg_drop_plain_index")]
+    #[sea_orm(table_name = "e2e_pg_drop_index")]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = true)]
         pub id: i32,
@@ -628,22 +579,22 @@ async fn drops_a_plain_index() {
     let _guard = serial().await;
     let db = connect().await;
 
-    db.execute_unprepared("DROP TABLE IF EXISTS \"e2e_pg_drop_plain_index\"")
+    db.execute_unprepared("DROP TABLE IF EXISTS \"e2e_pg_drop_index\"")
         .await
         .expect("drop the table");
     db.execute_unprepared(
-        "CREATE TABLE \"e2e_pg_drop_plain_index\" (\"id\" integer GENERATED BY DEFAULT AS IDENTITY NOT NULL PRIMARY KEY, \"email\" varchar NOT NULL, \"bio\" varchar NOT NULL)",
+        "CREATE TABLE \"e2e_pg_drop_index\" (\"id\" integer GENERATED BY DEFAULT AS IDENTITY NOT NULL PRIMARY KEY, \"email\" varchar NOT NULL, \"bio\" varchar NOT NULL)",
     )
     .await
     .expect("create the legacy table");
     // PostgreSQL has no inline `INDEX` clause in CREATE TABLE
-    db.execute_unprepared("CREATE INDEX \"bio\" ON \"e2e_pg_drop_plain_index\" (\"bio\")")
+    db.execute_unprepared("CREATE INDEX \"bio\" ON \"e2e_pg_drop_index\" (\"bio\")")
         .await
         .expect("create the legacy index");
 
-    check_and_apply(
+    common::check_and_apply(
         &db,
-        "e2e_pg_drop_plain_index",
+        "e2e_pg_drop_index",
         &["DROP INDEX \"bio\""],
     )
     .await;
@@ -663,7 +614,7 @@ async fn drops_a_unique_constraint() {
     .await
     .expect("create the legacy table");
 
-    check_and_apply(
+    common::check_and_apply(
         &db,
         "e2e_pg_drop_unique",
         &["ALTER TABLE \"e2e_pg_drop_unique\" DROP CONSTRAINT \"e2e_pg_drop_unique_email_key\""],
@@ -683,7 +634,7 @@ async fn makes_a_required_column_nullable() {
     )
     .await;
 
-    check_and_apply(
+    common::check_and_apply(
         &db,
         "e2e_pg_make_nullable",
         &["ALTER TABLE \"e2e_pg_make_nullable\" ALTER COLUMN \"name\" DROP NOT NULL"],
@@ -703,7 +654,7 @@ async fn drops_a_default_value() {
     )
     .await;
 
-    check_and_apply(
+    common::check_and_apply(
         &db,
         "e2e_pg_drop_default",
         &["ALTER TABLE \"e2e_pg_drop_default\" ALTER COLUMN \"role\" DROP DEFAULT"],
@@ -723,7 +674,7 @@ async fn adds_an_identity_to_a_primary_key() {
     )
     .await;
 
-    check_and_apply(
+    common::check_and_apply(
         &db,
         "e2e_pg_identity",
         &["ALTER TABLE \"e2e_pg_identity\" ALTER COLUMN \"id\" ADD GENERATED BY DEFAULT AS IDENTITY"],
@@ -776,8 +727,10 @@ async fn policy_item_rule_outranks_global_block() {
     let plan = plan_migrations(&db).await.expect("plan the migration");
 
     // Block everything globally, but explicitly allow dropping columns at L3.
-    let mut policy = RiskPolicy::default();
-    policy.global = RiskAction::Block;
+    let mut policy = RiskPolicy {
+        global: RiskAction::Block,
+        ..RiskPolicy::default()
+    };
     policy.items.insert(ChangeKind::DropColumn, RiskAction::Allow);
 
     apply_migrations_with(
@@ -802,7 +755,7 @@ async fn policy_level_rule_blocks_caution() {
 
     let plan = plan_migrations(&db).await.expect("plan the migration");
     assert!(
-        !statements_for(&plan, "e2e_pg_not_null").is_empty(),
+        !common::statements_for(&plan, "e2e_pg_not_null").is_empty(),
         "making `name` NOT NULL is a change"
     );
 

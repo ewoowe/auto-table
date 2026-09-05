@@ -20,7 +20,7 @@ use std::sync::OnceLock;
 
 use auto_table_core::{
     apply_migrations, apply_migrations_with, create_missing_tables, plan_migrations,
-    ChangeKind, MigrateOptions, MigrationOutcome, MigrationPlan, Risk, RiskAction, RiskPolicy,
+    ChangeKind, MigrateOptions, MigrationOutcome, Risk, RiskAction, RiskPolicy,
     TableError,
 };
 use sea_orm::{
@@ -57,72 +57,14 @@ async fn connect() -> DatabaseConnection {
     })
 }
 
-/// The statements planned for one table
-fn statements_for<'a>(plan: &'a MigrationPlan, table: &str) -> Vec<&'a str> {
-    plan.tables
-        .iter()
-        .find(|migration| migration.table == table)
-        .map(|migration| migration.statements.iter().map(String::as_str).collect())
-        .unwrap_or_default()
-}
+mod common;
 
-/// Recreates a table with a legacy definition, standing in for a database that
-/// is one migration behind
+/// Identifier quote character for this backend (`"` for SQLite/PostgreSQL,
+/// `` ` `` for MySQL).
+const QUOTE: char = '`';
+
 async fn create_legacy_table(db: &DatabaseConnection, table: &str, definition: &str) {
-    db.execute_unprepared(&format!("DROP TABLE IF EXISTS `{table}`"))
-        .await
-        .expect("drop the table");
-    db.execute_unprepared(&format!("CREATE TABLE `{table}` ({definition})"))
-        .await
-        .expect("create the legacy table");
-}
-
-/// Plans, checks the statements, applies them, then checks the plan is empty
-///
-/// The second check is the important one: after applying, planning again must
-/// produce nothing, otherwise parsing and reading back the schema disagree.
-async fn check_and_apply(db: &DatabaseConnection, table: &str, expected: &[&str]) {
-    let plan = plan_migrations(db).await.expect("plan the migration");
-    let statements = statements_for(&plan, table);
-    assert_eq!(statements, expected, "unexpected statements for `{table}`");
-
-    for sql in &statements {
-        db.execute_unprepared(sql)
-            .await
-            .unwrap_or_else(|error| panic!("applying `{sql}` failed: {error}"));
-    }
-
-    let plan = plan_migrations(db).await.expect("plan again after applying");
-    assert!(
-        statements_for(&plan, table).is_empty(),
-        "`{table}` is not idempotent, it still plans: {:?}",
-        statements_for(&plan, table)
-    );
-}
-
-/// Like [`check_and_apply`] but for a destructive plan: applying it without
-/// approval must be refused, and only `allow_destructive` lets it run and converge.
-async fn check_and_apply_destructive(db: &DatabaseConnection, table: &str, expected: &[&str]) {
-    let plan = plan_migrations(db).await.expect("plan the migration");
-    let statements = statements_for(&plan, table);
-    assert_eq!(statements, expected, "unexpected statements for `{table}`");
-
-    let blocked = apply_migrations(db, &plan).await;
-    assert!(
-        matches!(blocked, Err(TableError::DestructiveChangesBlocked { .. })),
-        "destructive change must be blocked by default, got {blocked:?}"
-    );
-
-    apply_migrations(db, &plan.allow_destructive())
-        .await
-        .expect("apply the plan after allowing destructive changes");
-
-    let plan = plan_migrations(db).await.expect("plan again after applying");
-    assert!(
-        statements_for(&plan, table).is_empty(),
-        "`{table}` is not idempotent, it still plans: {:?}",
-        statements_for(&plan, table)
-    );
+    common::create_legacy_table(db, table, QUOTE, definition).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -137,7 +79,7 @@ mod baseline {
 
     #[auto_table]
     #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
-    #[sea_orm(table_name = "e2e_baseline")]
+    #[sea_orm(table_name = "e2e_mysql_baseline")]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = true)]
         pub id: i32,
@@ -164,7 +106,7 @@ mod add_column {
 
     #[auto_table]
     #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
-    #[sea_orm(table_name = "e2e_add_column")]
+    #[sea_orm(table_name = "e2e_mysql_add_column")]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = true)]
         pub id: i32,
@@ -185,7 +127,7 @@ mod drop_column {
 
     #[auto_table]
     #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
-    #[sea_orm(table_name = "e2e_drop_column")]
+    #[sea_orm(table_name = "e2e_mysql_drop_column")]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = true)]
         pub id: i32,
@@ -205,7 +147,7 @@ mod change_type {
 
     #[auto_table]
     #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
-    #[sea_orm(table_name = "e2e_change_type")]
+    #[sea_orm(table_name = "e2e_mysql_change_type")]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = true)]
         pub id: i32,
@@ -219,13 +161,13 @@ mod change_type {
 }
 
 /// `name` becomes `NOT NULL`
-mod nullability {
+mod not_null {
     use auto_table_core::auto_table;
     use sea_orm::entity::prelude::*;
 
     #[auto_table]
     #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
-    #[sea_orm(table_name = "e2e_nullability")]
+    #[sea_orm(table_name = "e2e_mysql_not_null")]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = true)]
         pub id: i32,
@@ -245,7 +187,7 @@ mod default_value {
 
     #[auto_table]
     #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
-    #[sea_orm(table_name = "e2e_default")]
+    #[sea_orm(table_name = "e2e_mysql_default")]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = true)]
         pub id: i32,
@@ -266,7 +208,7 @@ mod add_index {
 
     #[auto_table]
     #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
-    #[sea_orm(table_name = "e2e_add_index")]
+    #[sea_orm(table_name = "e2e_mysql_add_index")]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = true)]
         pub id: i32,
@@ -287,7 +229,7 @@ mod drop_index {
 
     #[auto_table]
     #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
-    #[sea_orm(table_name = "e2e_drop_index")]
+    #[sea_orm(table_name = "e2e_mysql_drop_index")]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = true)]
         pub id: i32,
@@ -309,7 +251,7 @@ async fn a_table_created_by_the_library_is_already_in_sync() {
     let _guard = serial().await;
     let db = connect().await;
 
-    db.execute_unprepared("DROP TABLE IF EXISTS `e2e_baseline`")
+    db.execute_unprepared("DROP TABLE IF EXISTS `e2e_mysql_baseline`")
         .await
         .expect("drop the table");
     create_missing_tables(&db).await.expect("create the tables");
@@ -320,9 +262,9 @@ async fn a_table_created_by_the_library_is_already_in_sync() {
     // as tinyint(1), `Decimal` as decimal(10,0) and `i64` as bigint(20), and
     // none of those spellings may come back as a difference.
     assert!(
-        statements_for(&plan, "e2e_baseline").is_empty(),
+        common::statements_for(&plan, "e2e_mysql_baseline").is_empty(),
         "a table the library just created must not change, got: {:?}",
-        statements_for(&plan, "e2e_baseline")
+        common::statements_for(&plan, "e2e_mysql_baseline")
     );
 }
 
@@ -331,7 +273,7 @@ async fn a_table_that_does_not_exist_is_not_migrated() {
     let _guard = serial().await;
     let db = connect().await;
 
-    db.execute_unprepared("DROP TABLE IF EXISTS `e2e_baseline`")
+    db.execute_unprepared("DROP TABLE IF EXISTS `e2e_mysql_baseline`")
         .await
         .expect("drop the table");
 
@@ -339,7 +281,7 @@ async fn a_table_that_does_not_exist_is_not_migrated() {
 
     // Creating it is the job of create_missing_tables, not of a migration
     assert!(
-        statements_for(&plan, "e2e_baseline").is_empty(),
+        common::statements_for(&plan, "e2e_mysql_baseline").is_empty(),
         "a missing table must be left to table creation"
     );
 }
@@ -351,15 +293,15 @@ async fn adds_a_column_missing_from_the_table() {
 
     create_legacy_table(
         &db,
-        "e2e_add_column",
+        "e2e_mysql_add_column",
         "`id` int NOT NULL AUTO_INCREMENT, `email` varchar(255) NOT NULL, PRIMARY KEY (`id`)",
     )
     .await;
 
-    check_and_apply(
+    common::check_and_apply(
         &db,
-        "e2e_add_column",
-        &["ALTER TABLE `e2e_add_column` ADD COLUMN `bio` varchar(255)"],
+        "e2e_mysql_add_column",
+        &["ALTER TABLE `e2e_mysql_add_column` ADD COLUMN `bio` varchar(255)"],
     )
     .await;
 }
@@ -371,15 +313,15 @@ async fn drops_a_column_the_entity_no_longer_declares() {
 
     create_legacy_table(
         &db,
-        "e2e_drop_column",
+        "e2e_mysql_drop_column",
         "`id` int NOT NULL AUTO_INCREMENT, `email` varchar(255) NOT NULL, `obsolete` int DEFAULT NULL, PRIMARY KEY (`id`)",
     )
     .await;
 
-    check_and_apply_destructive(
+    common::check_and_apply_destructive(
         &db,
-        "e2e_drop_column",
-        &["ALTER TABLE `e2e_drop_column` DROP COLUMN `obsolete`"],
+        "e2e_mysql_drop_column",
+        &["ALTER TABLE `e2e_mysql_drop_column` DROP COLUMN `obsolete`"],
     )
     .await;
 }
@@ -391,16 +333,16 @@ async fn widens_a_column_type() {
 
     create_legacy_table(
         &db,
-        "e2e_change_type",
+        "e2e_mysql_change_type",
         "`id` int NOT NULL AUTO_INCREMENT, `score` int NOT NULL, PRIMARY KEY (`id`)",
     )
     .await;
 
     // MODIFY repeats the whole definition, because MySQL replaces it entirely
-    check_and_apply(
+    common::check_and_apply(
         &db,
-        "e2e_change_type",
-        &["ALTER TABLE `e2e_change_type` MODIFY COLUMN `score` bigint NOT NULL"],
+        "e2e_mysql_change_type",
+        &["ALTER TABLE `e2e_mysql_change_type` MODIFY COLUMN `score` bigint NOT NULL"],
     )
     .await;
 }
@@ -412,15 +354,15 @@ async fn makes_a_nullable_column_required() {
 
     create_legacy_table(
         &db,
-        "e2e_nullability",
+        "e2e_mysql_not_null",
         "`id` int NOT NULL AUTO_INCREMENT, `name` varchar(255) DEFAULT NULL, PRIMARY KEY (`id`)",
     )
     .await;
 
-    check_and_apply(
+    common::check_and_apply(
         &db,
-        "e2e_nullability",
-        &["ALTER TABLE `e2e_nullability` MODIFY COLUMN `name` varchar(255) NOT NULL"],
+        "e2e_mysql_not_null",
+        &["ALTER TABLE `e2e_mysql_not_null` MODIFY COLUMN `name` varchar(255) NOT NULL"],
     )
     .await;
 }
@@ -432,15 +374,15 @@ async fn adds_a_default_value() {
 
     create_legacy_table(
         &db,
-        "e2e_default",
+        "e2e_mysql_default",
         "`id` int NOT NULL AUTO_INCREMENT, `role` varchar(255) NOT NULL, PRIMARY KEY (`id`)",
     )
     .await;
 
-    check_and_apply(
+    common::check_and_apply(
         &db,
-        "e2e_default",
-        &["ALTER TABLE `e2e_default` MODIFY COLUMN `role` varchar(255) NOT NULL DEFAULT 'member'"],
+        "e2e_mysql_default",
+        &["ALTER TABLE `e2e_mysql_default` MODIFY COLUMN `role` varchar(255) NOT NULL DEFAULT 'member'"],
     )
     .await;
 }
@@ -452,15 +394,15 @@ async fn adds_a_missing_unique_index() {
 
     create_legacy_table(
         &db,
-        "e2e_add_index",
+        "e2e_mysql_add_index",
         "`id` int NOT NULL AUTO_INCREMENT, `email` varchar(255) NOT NULL, PRIMARY KEY (`id`)",
     )
     .await;
 
-    check_and_apply(
+    common::check_and_apply(
         &db,
-        "e2e_add_index",
-        &["ALTER TABLE `e2e_add_index` ADD UNIQUE INDEX `email` (`email`)"],
+        "e2e_mysql_add_index",
+        &["ALTER TABLE `e2e_mysql_add_index` ADD UNIQUE INDEX `email` (`email`)"],
     )
     .await;
 }
@@ -472,15 +414,15 @@ async fn drops_an_index_the_entity_no_longer_declares() {
 
     create_legacy_table(
         &db,
-        "e2e_drop_index",
+        "e2e_mysql_drop_index",
         "`id` int NOT NULL AUTO_INCREMENT, `email` varchar(255) NOT NULL, PRIMARY KEY (`id`), UNIQUE KEY `email` (`email`)",
     )
     .await;
 
-    check_and_apply(
+    common::check_and_apply(
         &db,
-        "e2e_drop_index",
-        &["ALTER TABLE `e2e_drop_index` DROP INDEX `email`"],
+        "e2e_mysql_drop_index",
+        &["ALTER TABLE `e2e_mysql_drop_index` DROP INDEX `email`"],
     )
     .await;
 }
@@ -493,7 +435,7 @@ async fn apply_migrations_brings_every_registered_table_in_sync() {
     // Put one table behind on purpose
     create_legacy_table(
         &db,
-        "e2e_add_column",
+        "e2e_mysql_add_column",
         "`id` int NOT NULL AUTO_INCREMENT, `email` varchar(255) NOT NULL, PRIMARY KEY (`id`)",
     )
     .await;
@@ -505,8 +447,8 @@ async fn apply_migrations_brings_every_registered_table_in_sync() {
 
     let plan = plan_migrations(&db).await.expect("plan again");
     assert!(
-        statements_for(&plan, "e2e_add_column").is_empty(),
-        "`e2e_add_column` should be in sync after applying"
+        common::statements_for(&plan, "e2e_mysql_add_column").is_empty(),
+        "`e2e_mysql_add_column` should be in sync after applying"
     );
 }
 
@@ -522,13 +464,13 @@ async fn a_second_instance_waits_while_the_lock_is_held() {
     // Put one table behind so there is something to migrate
     create_legacy_table(
         &db,
-        "e2e_add_column",
+        "e2e_mysql_add_column",
         "`id` int NOT NULL PRIMARY KEY AUTO_INCREMENT, `email` varchar(255) NOT NULL",
     )
     .await;
     let plan = plan_migrations(&db).await.expect("plan the migration");
     assert!(
-        !statements_for(&plan, "e2e_add_column").is_empty(),
+        !common::statements_for(&plan, "e2e_mysql_add_column").is_empty(),
         "there should be something to migrate"
     );
 
@@ -578,7 +520,7 @@ async fn a_second_instance_waits_while_the_lock_is_held() {
 
     let plan = plan_migrations(&db).await.expect("plan again");
     assert!(
-        statements_for(&plan, "e2e_add_column").is_empty(),
+        common::statements_for(&plan, "e2e_mysql_add_column").is_empty(),
         "the migration must have been applied"
     );
 }
@@ -591,12 +533,12 @@ async fn a_stale_plan_is_not_replayed_when_the_lock_is_taken() {
 
     create_legacy_table(
         &db,
-        "e2e_add_column",
+        "e2e_mysql_add_column",
         "`id` int NOT NULL PRIMARY KEY AUTO_INCREMENT, `email` varchar(255) NOT NULL",
     )
     .await;
     let stale = plan_migrations(&db).await.expect("plan the migration");
-    let stale_statements: Vec<String> = statements_for(&stale, "e2e_add_column")
+    let stale_statements: Vec<String> = common::statements_for(&stale, "e2e_mysql_add_column")
         .into_iter()
         .map(str::to_string)
         .collect();
@@ -639,7 +581,7 @@ async fn a_stale_plan_is_not_replayed_when_the_lock_is_taken() {
 
     let plan = plan_migrations(&db).await.expect("plan again");
     assert!(
-        statements_for(&plan, "e2e_add_column").is_empty(),
+        common::statements_for(&plan, "e2e_mysql_add_column").is_empty(),
         "nothing should be left to migrate"
     );
 }
@@ -652,7 +594,7 @@ async fn migrate_plans_and_applies_in_one_step() {
 
     create_legacy_table(
         &db,
-        "e2e_add_column",
+        "e2e_mysql_add_column",
         "`id` int NOT NULL PRIMARY KEY AUTO_INCREMENT, `email` varchar(255) NOT NULL",
     )
     .await;
@@ -664,7 +606,7 @@ async fn migrate_plans_and_applies_in_one_step() {
 
     let plan = plan_migrations(&db).await.expect("plan again");
     assert!(
-        statements_for(&plan, "e2e_add_column").is_empty(),
+        common::statements_for(&plan, "e2e_mysql_add_column").is_empty(),
         "migrate must have applied everything"
     );
 }
@@ -812,7 +754,7 @@ async fn adds_a_not_null_column_with_a_default() {
     )
     .await;
 
-    check_and_apply(
+    common::check_and_apply(
         &db,
         "e2e_mysql_notnull_default",
         &["ALTER TABLE `e2e_mysql_notnull_default` ADD COLUMN `role` varchar(255) NOT NULL DEFAULT 'member'"],
@@ -834,7 +776,7 @@ async fn adds_a_required_column_without_a_default() {
 
     // Under MySQL's strict mode the missing default is filled silently rather
     // than rejected, which is exactly the "Caution" row in the risk table.
-    check_and_apply(
+    common::check_and_apply(
         &db,
         "e2e_mysql_notnull_nodefault",
         &["ALTER TABLE `e2e_mysql_notnull_nodefault` ADD COLUMN `role` varchar(255) NOT NULL"],
@@ -854,7 +796,7 @@ async fn drops_a_plain_index() {
     )
     .await;
 
-    check_and_apply(
+    common::check_and_apply(
         &db,
         "e2e_mysql_drop_plain_index",
         &["ALTER TABLE `e2e_mysql_drop_plain_index` DROP INDEX `bio`"],
@@ -874,7 +816,7 @@ async fn adds_auto_increment_to_a_primary_key() {
     )
     .await;
 
-    check_and_apply(
+    common::check_and_apply(
         &db,
         "e2e_mysql_autoinc",
         &["ALTER TABLE `e2e_mysql_autoinc` MODIFY COLUMN `id` int NOT NULL AUTO_INCREMENT"],
@@ -888,7 +830,7 @@ async fn policy_item_rule_outranks_allow_destructive() {
     let db = connect().await;
     create_legacy_table(
         &db,
-        "e2e_drop_column",
+        "e2e_mysql_drop_column",
         "`id` int NOT NULL AUTO_INCREMENT, `email` varchar(255) NOT NULL, `obsolete` int DEFAULT NULL, PRIMARY KEY (`id`)",
     )
     .await;
@@ -919,7 +861,7 @@ async fn policy_item_rule_outranks_global_block() {
     let db = connect().await;
     create_legacy_table(
         &db,
-        "e2e_drop_column",
+        "e2e_mysql_drop_column",
         "`id` int NOT NULL AUTO_INCREMENT, `email` varchar(255) NOT NULL, `obsolete` int DEFAULT NULL, PRIMARY KEY (`id`)",
     )
     .await;
@@ -927,8 +869,10 @@ async fn policy_item_rule_outranks_global_block() {
     let plan = plan_migrations(&db).await.expect("plan the migration");
 
     // Block everything globally, but explicitly allow dropping columns at L3.
-    let mut policy = RiskPolicy::default();
-    policy.global = RiskAction::Block;
+    let mut policy = RiskPolicy {
+        global: RiskAction::Block,
+        ..RiskPolicy::default()
+    };
     policy.items.insert(ChangeKind::DropColumn, RiskAction::Allow);
 
     apply_migrations_with(
@@ -946,14 +890,14 @@ async fn policy_level_rule_blocks_caution() {
     let db = connect().await;
     create_legacy_table(
         &db,
-        "e2e_nullability",
+        "e2e_mysql_not_null",
         "`id` int NOT NULL AUTO_INCREMENT, `name` varchar(255) DEFAULT NULL, PRIMARY KEY (`id`)",
     )
     .await;
 
     let plan = plan_migrations(&db).await.expect("plan the migration");
     assert!(
-        !statements_for(&plan, "e2e_nullability").is_empty(),
+        !common::statements_for(&plan, "e2e_mysql_not_null").is_empty(),
         "making `name` NOT NULL is a change"
     );
 

@@ -366,9 +366,10 @@ mod tests {
 
     #[test]
     fn policy_layers_precedence_most_specific_wins() {
-        let mut policy = RiskPolicy::default();
-        // L1: block everything.
-        policy.global = RiskAction::Block;
+        let mut policy = RiskPolicy {
+            global: RiskAction::Block,
+            ..RiskPolicy::default()
+        };
         // L2: but allow the whole Caution level.
         policy.levels.insert(Risk::Caution, RiskAction::Allow);
         // L3: except this specific item, which must stay blocked.

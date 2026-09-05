@@ -679,8 +679,10 @@ mod tests {
         assert!(ensure_allowed(&plan, &policy).is_ok());
 
         // L1 (global) block still applies to the Caution item with no L3 rule.
-        let mut policy = RiskPolicy::default();
-        policy.global = RiskAction::Block;
+        let mut policy = RiskPolicy {
+            global: RiskAction::Block,
+            ..RiskPolicy::default()
+        };
         policy.items.insert(ChangeKind::DropColumn, RiskAction::Allow);
         assert!(ensure_allowed(&plan, &policy).is_err());
     }

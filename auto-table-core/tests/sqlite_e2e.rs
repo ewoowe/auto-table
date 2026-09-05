@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use auto_table_core::{
     apply_migrations, apply_migrations_with, create_missing_tables, plan_migrations, ChangeKind,
-    MigrationPlan, MigrateOptions, Risk, RiskAction, RiskPolicy, TableError,
+    MigrateOptions, Risk, RiskAction, RiskPolicy, TableError,
 };
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
 
@@ -48,63 +48,14 @@ impl Drop for TempDb {
     }
 }
 
-fn statements_for<'a>(plan: &'a MigrationPlan, table: &str) -> Vec<&'a str> {
-    plan.tables
-        .iter()
-        .find(|migration| migration.table == table)
-        .map(|migration| migration.statements.iter().map(String::as_str).collect())
-        .unwrap_or_default()
-}
+mod common;
 
-/// Recreates a table with a legacy definition
+/// Identifier quote character for this backend (`"` for SQLite/PostgreSQL,
+/// `` ` `` for MySQL).
+const QUOTE: char = '"';
+
 async fn create_legacy_table(db: &DatabaseConnection, table: &str, definition: &str) {
-    db.execute_unprepared(&format!("DROP TABLE IF EXISTS \"{table}\""))
-        .await
-        .expect("drop the table");
-    db.execute_unprepared(&format!("CREATE TABLE \"{table}\" ({definition})"))
-        .await
-        .expect("create the legacy table");
-}
-
-/// Plans, checks the statements, applies them, then checks the plan is empty
-async fn check_and_apply(db: &DatabaseConnection, table: &str, expected: &[&str]) {
-    let plan = plan_migrations(db).await.expect("plan the migration");
-    let statements = statements_for(&plan, table);
-    assert_eq!(statements, expected, "unexpected statements for `{table}`");
-
-    apply_migrations(db, &plan).await.expect("apply the plan");
-
-    let plan = plan_migrations(db).await.expect("plan again after applying");
-    assert!(
-        statements_for(&plan, table).is_empty(),
-        "`{table}` is not idempotent, it still plans: {:?}",
-        statements_for(&plan, table)
-    );
-}
-
-/// Like [`check_and_apply`] but for a destructive plan: applying it without
-/// approval must be refused, and only `allow_destructive` lets it run and converge.
-async fn check_and_apply_destructive(db: &DatabaseConnection, table: &str, expected: &[&str]) {
-    let plan = plan_migrations(db).await.expect("plan the migration");
-    let statements = statements_for(&plan, table);
-    assert_eq!(statements, expected, "unexpected statements for `{table}`");
-
-    let blocked = apply_migrations(db, &plan).await;
-    assert!(
-        matches!(blocked, Err(TableError::DestructiveChangesBlocked { .. })),
-        "destructive change must be blocked by default, got {blocked:?}"
-    );
-
-    apply_migrations(db, &plan.allow_destructive())
-        .await
-        .expect("apply the plan after allowing destructive changes");
-
-    let plan = plan_migrations(db).await.expect("plan again after applying");
-    assert!(
-        statements_for(&plan, table).is_empty(),
-        "`{table}` is not idempotent, it still plans: {:?}",
-        statements_for(&plan, table)
-    );
+    common::create_legacy_table(db, table, QUOTE, definition).await;
 }
 
 async fn scalar(db: &DatabaseConnection, sql: &str) -> i64 {
@@ -192,13 +143,13 @@ mod drop_column {
 }
 
 /// `score` is declared as `i64` while the table has an integer column
-mod widen {
+mod change_type {
     use auto_table_core::auto_table;
     use sea_orm::entity::prelude::*;
 
     #[auto_table]
     #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
-    #[sea_orm(table_name = "e2e_sqlite_widen")]
+    #[sea_orm(table_name = "e2e_sqlite_change_type")]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = true)]
         pub id: i32,
@@ -288,9 +239,9 @@ async fn a_table_created_by_the_library_is_already_in_sync() {
     // SQLite stores types loosely: i32 and i64 both become INTEGER affinity,
     // `Decimal` becomes REAL, and none of that may look like a difference.
     assert!(
-        statements_for(&plan, "e2e_sqlite_baseline").is_empty(),
+        common::statements_for(&plan, "e2e_sqlite_baseline").is_empty(),
         "a table the library just created must not change, got: {:?}",
-        statements_for(&plan, "e2e_sqlite_baseline")
+        common::statements_for(&plan, "e2e_sqlite_baseline")
     );
 }
 
@@ -306,7 +257,7 @@ async fn adds_a_column_without_rebuilding() {
     .await;
 
     // The type is reported as its affinity, which is what SQLite itself stores
-    check_and_apply(
+    common::check_and_apply(
         &db.db,
         "e2e_sqlite_add_column",
         &["ALTER TABLE \"e2e_sqlite_add_column\" ADD COLUMN \"bio\" TEXT"],
@@ -325,7 +276,7 @@ async fn drops_a_column_without_rebuilding() {
     )
     .await;
 
-    check_and_apply_destructive(
+    common::check_and_apply_destructive(
         &db.db,
         "e2e_sqlite_drop_column",
         &["ALTER TABLE \"e2e_sqlite_drop_column\" DROP COLUMN \"obsolete\""],
@@ -376,8 +327,10 @@ async fn policy_item_rule_outranks_global_block() {
     let plan = plan_migrations(&db.db).await.expect("plan the migration");
 
     // Block everything globally, but explicitly allow dropping columns at L3.
-    let mut policy = RiskPolicy::default();
-    policy.global = RiskAction::Block;
+    let mut policy = RiskPolicy {
+        global: RiskAction::Block,
+        ..RiskPolicy::default()
+    };
     policy.items.insert(ChangeKind::DropColumn, RiskAction::Allow);
 
     apply_migrations_with(
@@ -401,7 +354,7 @@ async fn policy_level_rule_blocks_caution() {
 
     let plan = plan_migrations(&db.db).await.expect("plan the migration");
     assert!(
-        !statements_for(&plan, "e2e_sqlite_not_null").is_empty(),
+        !common::statements_for(&plan, "e2e_sqlite_not_null").is_empty(),
         "making `name` NOT NULL is a change"
     );
 
@@ -429,7 +382,7 @@ async fn widening_i32_to_i64_is_not_a_change() {
     // INTEGER affinity in SQLite, so there is nothing to rebuild.
     create_legacy_table(
         &db.db,
-        "e2e_sqlite_widen",
+        "e2e_sqlite_change_type",
         "\"id\" integer NOT NULL PRIMARY KEY AUTOINCREMENT, \"score\" integer NOT NULL",
     )
     .await;
@@ -437,9 +390,9 @@ async fn widening_i32_to_i64_is_not_a_change() {
     let plan = plan_migrations(&db.db).await.expect("plan the migration");
 
     assert!(
-        statements_for(&plan, "e2e_sqlite_widen").is_empty(),
+        common::statements_for(&plan, "e2e_sqlite_change_type").is_empty(),
         "equal type affinities must not trigger a rebuild, got: {:?}",
-        statements_for(&plan, "e2e_sqlite_widen")
+        common::statements_for(&plan, "e2e_sqlite_change_type")
     );
 }
 
@@ -463,7 +416,7 @@ async fn rebuilding_keeps_the_rows() {
     // Requiring `name` forces a rebuild, which must not lose the rows
     let plan = plan_migrations(&db.db).await.expect("plan the migration");
     assert!(
-        !statements_for(&plan, "e2e_sqlite_not_null").is_empty(),
+        !common::statements_for(&plan, "e2e_sqlite_not_null").is_empty(),
         "making a column NOT NULL should require a migration"
     );
     apply_migrations(&db.db, &plan).await.expect("apply the plan");
@@ -486,9 +439,9 @@ async fn rebuilding_keeps_the_rows() {
     // And the rebuild must have reached the intended structure
     let plan = plan_migrations(&db.db).await.expect("plan again");
     assert!(
-        statements_for(&plan, "e2e_sqlite_not_null").is_empty(),
+        common::statements_for(&plan, "e2e_sqlite_not_null").is_empty(),
         "the rebuilt table must match the entity, still plans: {:?}",
-        statements_for(&plan, "e2e_sqlite_not_null")
+        common::statements_for(&plan, "e2e_sqlite_not_null")
     );
 }
 
@@ -504,7 +457,7 @@ async fn adds_a_default_value_by_rebuilding() {
     .await;
 
     let plan = plan_migrations(&db.db).await.expect("plan the migration");
-    let statements = statements_for(&plan, "e2e_sqlite_default");
+    let statements = common::statements_for(&plan, "e2e_sqlite_default");
     assert!(
         statements.iter().any(|sql| sql.contains("__auto_table_rebuild")),
         "changing a default must rebuild the table, got: {statements:?}"
@@ -514,7 +467,7 @@ async fn adds_a_default_value_by_rebuilding() {
 
     let plan = plan_migrations(&db.db).await.expect("plan again");
     assert!(
-        statements_for(&plan, "e2e_sqlite_default").is_empty(),
+        common::statements_for(&plan, "e2e_sqlite_default").is_empty(),
         "the rebuilt table must match the entity"
     );
 }
@@ -534,7 +487,7 @@ async fn adds_a_missing_unique_index_by_rebuilding() {
     // only be added by rebuilding
     let plan = plan_migrations(&db.db).await.expect("plan the migration");
     assert!(
-        statements_for(&plan, "e2e_sqlite_add_index")
+        common::statements_for(&plan, "e2e_sqlite_add_index")
             .iter()
             .any(|sql| sql.contains("__auto_table_rebuild")),
         "a new unique constraint must rebuild the table"
@@ -544,7 +497,7 @@ async fn adds_a_missing_unique_index_by_rebuilding() {
 
     let plan = plan_migrations(&db.db).await.expect("plan again");
     assert!(
-        statements_for(&plan, "e2e_sqlite_add_index").is_empty(),
+        common::statements_for(&plan, "e2e_sqlite_add_index").is_empty(),
         "the rebuilt table must match the entity"
     );
 
@@ -654,7 +607,7 @@ async fn adds_a_not_null_column_with_a_default() {
     )
     .await;
 
-    check_and_apply(
+    common::check_and_apply(
         &db.db,
         "e2e_sqlite_notnull_default",
         &["ALTER TABLE \"e2e_sqlite_notnull_default\" ADD COLUMN \"role\" TEXT NOT NULL DEFAULT 'member'"],
@@ -679,7 +632,7 @@ async fn drops_an_index_by_rebuilding() {
 
     // Dropping an index rebuilds the table on SQLite
     let plan = plan_migrations(&db.db).await.expect("plan the migration");
-    let statements = statements_for(&plan, "e2e_sqlite_drop_index");
+    let statements = common::statements_for(&plan, "e2e_sqlite_drop_index");
     assert!(
         statements.iter().any(|sql| sql.contains("__auto_table_rebuild")),
         "dropping an index must rebuild the table, got: {statements:?}"
@@ -689,7 +642,7 @@ async fn drops_an_index_by_rebuilding() {
 
     let plan = plan_migrations(&db.db).await.expect("plan again");
     assert!(
-        statements_for(&plan, "e2e_sqlite_drop_index").is_empty(),
+        common::statements_for(&plan, "e2e_sqlite_drop_index").is_empty(),
         "the rebuilt table must match the entity"
     );
 
@@ -715,7 +668,7 @@ async fn changes_a_default_value_by_rebuilding() {
 
     let plan = plan_migrations(&db.db).await.expect("plan the migration");
     assert!(
-        statements_for(&plan, "e2e_sqlite_change_default")
+        common::statements_for(&plan, "e2e_sqlite_change_default")
             .iter()
             .any(|sql| sql.contains("__auto_table_rebuild")),
         "changing a default must rebuild the table"
@@ -725,7 +678,7 @@ async fn changes_a_default_value_by_rebuilding() {
 
     let plan = plan_migrations(&db.db).await.expect("plan again");
     assert!(
-        statements_for(&plan, "e2e_sqlite_change_default").is_empty(),
+        common::statements_for(&plan, "e2e_sqlite_change_default").is_empty(),
         "the rebuilt table must match the entity"
     );
 }
