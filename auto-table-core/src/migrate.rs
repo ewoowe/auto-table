@@ -12,8 +12,8 @@ use sea_orm::{
     ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbBackend, Statement, TransactionTrait,
 };
 
-use crate::diff::{diff_table, ColumnChange, IndexChange, TableDiff};
-use crate::parse::{parse_create_table, PRIMARY_INDEX_NAME};
+use crate::diff::{diff_table, ColumnAspect, ColumnChange, IndexChange, TableDiff};
+use crate::parse::parse_create_table;
 use crate::schema::{get_table_schema, sqlite_type_affinity, ColumnSchema, IndexSchema};
 use crate::{get_all_table_statements, get_existing_tables, get_table_name, TableError};
 
@@ -276,6 +276,10 @@ pub fn plan_table_migration(
             diff.table.clone(),
             sqlite_simple_alters(diff),
         )),
+        DbBackend::Postgres => Ok(TableMigration::new(
+            diff.table.clone(),
+            postgres_statements(diff),
+        )),
         other => Err(TableError::UnsupportedBackend(other)),
     }
 }
@@ -339,6 +343,7 @@ async fn apply_under_lock(
     let acquired = match backend {
         DbBackend::MySql => acquire_mysql_lock(&transaction, options.lock_timeout_secs).await,
         DbBackend::Sqlite => acquire_sqlite_lock(&transaction, options.lock_timeout_secs).await,
+        DbBackend::Postgres => acquire_postgres_lock(&transaction, options.lock_timeout_secs).await,
         other => Err(TableError::UnsupportedBackend(other)),
     };
 
@@ -469,12 +474,77 @@ async fn acquire_sqlite_lock(
     Ok(true)
 }
 
+/// Key for PostgreSQL's advisory lock
+///
+/// Advisory locks are scoped to the database, so a fixed key is enough — unlike
+/// MySQL there is nothing to disambiguate between schemas on one server.
+const ADVISORY_LOCK_KEY: i64 = 0x6175_746f_7462_6c65;
+
+/// Takes PostgreSQL's advisory lock
+///
+/// Like MySQL's `GET_LOCK` it is session scoped, so it is taken on the
+/// transaction that runs the migration.
+async fn acquire_postgres_lock(
+    transaction: &DatabaseTransaction,
+    timeout_secs: u32,
+) -> Result<bool, TableError> {
+    if timeout_secs == 0 {
+        // Report straight away whether the lock was free
+        let row = transaction
+            .query_one_raw(Statement::from_string(
+                DbBackend::Postgres,
+                format!("SELECT pg_try_advisory_lock({ADVISORY_LOCK_KEY})"),
+            ))
+            .await
+            .map_err(|source| TableError::MigrationFailed {
+                sql: "pg_try_advisory_lock".to_string(),
+                source,
+            })?;
+
+        return Ok(row
+            .and_then(|row| row.try_get_by_index::<bool>(0).ok())
+            .unwrap_or(false));
+    }
+
+    // Wait, but not forever. A lock that times out raises an error instead of
+    // returning false, so an error here is reported as "not acquired".
+    execute(
+        transaction,
+        &format!("SET LOCAL lock_timeout = '{timeout_secs}s'"),
+    )
+    .await?;
+
+    let locked = transaction
+        .execute_raw(Statement::from_string(
+            DbBackend::Postgres,
+            format!("SELECT pg_advisory_lock({ADVISORY_LOCK_KEY})"),
+        ))
+        .await;
+
+    Ok(locked.is_ok())
+}
+
+async fn release_postgres_lock(transaction: &DatabaseTransaction) -> Result<(), TableError> {
+    transaction
+        .execute_raw(Statement::from_string(
+            DbBackend::Postgres,
+            format!("SELECT pg_advisory_unlock({ADVISORY_LOCK_KEY})"),
+        ))
+        .await
+        .map_err(|source| TableError::MigrationFailed {
+            sql: "pg_advisory_unlock".to_string(),
+            source,
+        })?;
+    Ok(())
+}
+
 async fn release_lock(
     transaction: &DatabaseTransaction,
     backend: DbBackend,
 ) -> Result<(), TableError> {
     match backend {
         DbBackend::MySql => release_mysql_lock(transaction).await,
+        DbBackend::Postgres => release_postgres_lock(transaction).await,
         // SQLite releases its write lock when the transaction ends
         _ => Ok(()),
     }
@@ -557,11 +627,14 @@ fn mysql_statements(diff: &TableDiff) -> Vec<String> {
     let mut statements = Vec::new();
 
     for change in &diff.indexes {
-        if let IndexChange::Drop { name } = change {
-            statements.push(if name == PRIMARY_INDEX_NAME {
+        if let IndexChange::Drop(index) = change {
+            statements.push(if index.primary {
                 format!("ALTER TABLE {table} DROP PRIMARY KEY")
             } else {
-                format!("ALTER TABLE {table} DROP INDEX {}", quote_mysql_identifier(name))
+                format!(
+                    "ALTER TABLE {table} DROP INDEX {}",
+                    quote_mysql_identifier(&index.name)
+                )
             });
         }
     }
@@ -688,8 +761,11 @@ fn sqlite_simple_alters(diff: &TableDiff) -> Vec<String> {
     let mut statements = Vec::new();
 
     for change in &diff.indexes {
-        if let IndexChange::Drop { name } = change {
-            statements.push(format!("DROP INDEX {}", quote_sqlite_identifier(name)));
+        if let IndexChange::Drop(index) = change {
+            statements.push(format!(
+                "DROP INDEX {}",
+                quote_sqlite_identifier(&index.name)
+            ));
         }
     }
 
@@ -885,10 +961,174 @@ fn quote_sqlite_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+// ---------------------------------------------------------------------------
+// PostgreSQL
+// ---------------------------------------------------------------------------
+
+/// Builds the PostgreSQL statements for a diff
+///
+/// The order follows the MySQL one — drop indexes, drop columns, add columns,
+/// change columns, add indexes — but two things differ:
+///
+/// - A column change is **one clause per aspect** rather than a single
+///   `MODIFY COLUMN`: type, nullability, default and identity each get their own
+///   `ALTER COLUMN` statement.
+/// - Indexes backed by a constraint are added and dropped as constraints.
+///   PostgreSQL refuses to drop such an index with `DROP INDEX`, because the
+///   constraint depends on it.
+fn postgres_statements(diff: &TableDiff) -> Vec<String> {
+    let table = quote_postgres_identifier(&diff.table);
+    let mut statements = Vec::new();
+
+    for change in &diff.indexes {
+        if let IndexChange::Drop(index) = change {
+            statements.push(postgres_drop_index(&diff.table, index));
+        }
+    }
+
+    for change in &diff.columns {
+        if let ColumnChange::Drop { name } = change {
+            statements.push(format!(
+                "ALTER TABLE {table} DROP COLUMN {}",
+                quote_postgres_identifier(name)
+            ));
+        }
+    }
+
+    for change in &diff.columns {
+        if let ColumnChange::Add(column) = change {
+            statements.push(format!(
+                "ALTER TABLE {table} ADD COLUMN {}",
+                postgres_column_definition(column)
+            ));
+        }
+    }
+
+    for change in &diff.columns {
+        if let ColumnChange::Alter { name, aspects, .. } = change {
+            let column = quote_postgres_identifier(name);
+            for aspect in aspects {
+                statements.push(match aspect {
+                    ColumnAspect::Type { to, .. } => {
+                        format!("ALTER TABLE {table} ALTER COLUMN {column} TYPE {to}")
+                    }
+                    ColumnAspect::Nullable { to, .. } => {
+                        let action = if *to { "DROP" } else { "SET" };
+                        format!("ALTER TABLE {table} ALTER COLUMN {column} {action} NOT NULL")
+                    }
+                    ColumnAspect::Default { to, .. } => match to {
+                        Some(value) => format!(
+                            "ALTER TABLE {table} ALTER COLUMN {column} SET DEFAULT {}",
+                            quote_postgres_literal(value)
+                        ),
+                        None => {
+                            format!("ALTER TABLE {table} ALTER COLUMN {column} DROP DEFAULT")
+                        }
+                    },
+                    ColumnAspect::AutoIncrement { to, .. } => {
+                        let action = if *to { "ADD" } else { "DROP" };
+                        format!(
+                            "ALTER TABLE {table} ALTER COLUMN {column} {action} GENERATED BY DEFAULT AS IDENTITY"
+                        )
+                    }
+                });
+            }
+        }
+    }
+
+    for change in &diff.indexes {
+        if let IndexChange::Add(index) = change {
+            statements.push(postgres_add_index(&diff.table, index));
+        }
+    }
+
+    statements
+}
+
+fn postgres_column_definition(column: &ColumnSchema) -> String {
+    let mut definition = format!(
+        "{} {}",
+        quote_postgres_identifier(&column.name),
+        column.col_type
+    );
+
+    if !column.nullable {
+        definition.push_str(" NOT NULL");
+    }
+    if let Some(default) = &column.default {
+        definition.push_str(&format!(
+            " DEFAULT {}",
+            quote_postgres_literal(default)
+        ));
+    }
+
+    definition
+}
+
+fn postgres_add_index(table_name: &str, index: &IndexSchema) -> String {
+    let table = quote_postgres_identifier(table_name);
+    let columns = postgres_column_list(&index.columns);
+
+    if index.primary {
+        format!("ALTER TABLE {table} ADD PRIMARY KEY ({columns})")
+    } else if index.unique {
+        let constraint = quote_postgres_identifier(&postgres_unique_constraint_name(
+            table_name,
+            &index.columns,
+        ));
+        format!("ALTER TABLE {table} ADD CONSTRAINT {constraint} UNIQUE ({columns})")
+    } else {
+        let name = quote_postgres_identifier(&index.name);
+        format!("CREATE INDEX {name} ON {table} ({columns})")
+    }
+}
+
+fn postgres_drop_index(table_name: &str, index: &IndexSchema) -> String {
+    let table = quote_postgres_identifier(table_name);
+
+    if index.primary {
+        // PostgreSQL names the primary key constraint <table>_pkey
+        let constraint = quote_postgres_identifier(&format!("{table_name}_pkey"));
+        format!("ALTER TABLE {table} DROP CONSTRAINT {constraint}")
+    } else if index.unique {
+        let constraint = quote_postgres_identifier(&postgres_unique_constraint_name(
+            table_name,
+            &index.columns,
+        ));
+        format!("ALTER TABLE {table} DROP CONSTRAINT {constraint}")
+    } else {
+        // A plain index, with no constraint behind it
+        format!("DROP INDEX {}", quote_postgres_identifier(&index.name))
+    }
+}
+
+/// The name PostgreSQL gives a unique constraint: `<table>_<columns>_key`
+fn postgres_unique_constraint_name(table_name: &str, columns: &[String]) -> String {
+    format!("{table_name}_{}_key", columns.join("_"))
+}
+
+fn postgres_column_list(columns: &[String]) -> String {
+    columns
+        .iter()
+        .map(|column| quote_postgres_identifier(column))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Quotes an identifier, PostgreSQL style
+fn quote_postgres_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn quote_postgres_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::diff::ColumnAspect;
+    use crate::parse::PRIMARY_INDEX_NAME;
 
     fn column(name: &str, col_type: &str) -> ColumnSchema {
         ColumnSchema {
@@ -914,6 +1154,11 @@ mod tests {
 
     fn sqlite_plan(columns: Vec<ColumnChange>, indexes: Vec<IndexChange>) -> Vec<String> {
         plan_table_statements(&diff(columns, indexes), DbBackend::Sqlite).expect("sqlite is supported")
+    }
+
+    fn postgres_plan(columns: Vec<ColumnChange>, indexes: Vec<IndexChange>) -> Vec<String> {
+        plan_table_statements(&diff(columns, indexes), DbBackend::Postgres)
+            .expect("postgres is supported")
     }
 
     // ---------------------------------------------------------------- mysql
@@ -967,7 +1212,12 @@ mod tests {
             mysql_plan(
                 vec![ColumnChange::Drop { name: "legacy".to_string() }],
                 vec![
-                    IndexChange::Drop { name: "email".to_string() },
+                    IndexChange::Drop(IndexSchema {
+                        name: "email".to_string(),
+                        columns: vec!["email".to_string()],
+                        unique: true,
+                        primary: false,
+                    }),
                     IndexChange::Add(IndexSchema {
                         name: "email".to_string(),
                         columns: vec!["email".to_string()],
@@ -996,7 +1246,12 @@ mod tests {
                         unique: true,
                         primary: true,
                     }),
-                    IndexChange::Drop { name: PRIMARY_INDEX_NAME.to_string() },
+                    IndexChange::Drop(IndexSchema {
+                        name: PRIMARY_INDEX_NAME.to_string(),
+                        columns: vec!["id".to_string()],
+                        unique: true,
+                        primary: true,
+                    }),
                 ],
             ),
             vec![
@@ -1168,13 +1423,142 @@ mod tests {
     }
 
     #[test]
-    fn only_mysql_and_sqlite_are_supported() {
+    fn every_backend_plans_statements() {
         let empty = diff(vec![], vec![]);
 
-        assert!(matches!(
-            plan_table_statements(&empty, DbBackend::Postgres),
-            Err(TableError::UnsupportedBackend(DbBackend::Postgres))
-        ));
+        for backend in [DbBackend::MySql, DbBackend::Sqlite, DbBackend::Postgres] {
+            let statements = plan_table_statements(&empty, backend)
+                .unwrap_or_else(|error| panic!("{backend:?} should be supported: {error}"));
+            assert!(statements.is_empty(), "{backend:?} planned {statements:?}");
+        }
+    }
+
+    #[test]
+    fn postgres_changes_one_aspect_per_statement() {
+        // Unlike MySQL, which folds everything into one MODIFY COLUMN
+        let target = ColumnSchema {
+            name: "age".to_string(),
+            col_type: "bigint".to_string(),
+            nullable: false,
+            default: Some("0".to_string()),
+            auto_increment: false,
+        };
+
+        assert_eq!(
+            postgres_plan(
+                vec![ColumnChange::Alter {
+                    name: "age".to_string(),
+                    to: target,
+                    aspects: vec![
+                        ColumnAspect::Type {
+                            from: "integer".to_string(),
+                            to: "bigint".to_string(),
+                        },
+                        ColumnAspect::Nullable {
+                            from: true,
+                            to: false,
+                        },
+                        ColumnAspect::Default {
+                            from: None,
+                            to: Some("0".to_string()),
+                        },
+                    ],
+                }],
+                vec![],
+            ),
+            vec![
+                "ALTER TABLE \"users\" ALTER COLUMN \"age\" TYPE bigint",
+                "ALTER TABLE \"users\" ALTER COLUMN \"age\" SET NOT NULL",
+                "ALTER TABLE \"users\" ALTER COLUMN \"age\" SET DEFAULT '0'",
+            ]
+        );
+    }
+
+    #[test]
+    fn postgres_adds_and_drops_columns() {
+        assert_eq!(
+            postgres_plan(
+                vec![
+                    ColumnChange::Add(column("bio", "varchar")),
+                    ColumnChange::Drop {
+                        name: "legacy".to_string()
+                    },
+                ],
+                vec![],
+            ),
+            vec![
+                "ALTER TABLE \"users\" DROP COLUMN \"legacy\"",
+                "ALTER TABLE \"users\" ADD COLUMN \"bio\" varchar",
+            ]
+        );
+    }
+
+    #[test]
+    fn postgres_drops_a_unique_constraint_not_its_index() {
+        // PostgreSQL refuses to drop an index that a constraint depends on
+        assert_eq!(
+            postgres_plan(
+                vec![],
+                vec![IndexChange::Drop(IndexSchema {
+                    name: "email".to_string(),
+                    columns: vec!["email".to_string()],
+                    unique: true,
+                    primary: false,
+                })],
+            ),
+            vec!["ALTER TABLE \"users\" DROP CONSTRAINT \"users_email_key\""]
+        );
+    }
+
+    #[test]
+    fn postgres_adds_a_unique_constraint() {
+        assert_eq!(
+            postgres_plan(
+                vec![],
+                vec![IndexChange::Add(IndexSchema {
+                    name: "email".to_string(),
+                    columns: vec!["email".to_string()],
+                    unique: true,
+                    primary: false,
+                })],
+            ),
+            vec!["ALTER TABLE \"users\" ADD CONSTRAINT \"users_email_key\" UNIQUE (\"email\")"]
+        );
+    }
+
+    #[test]
+    fn postgres_uses_its_own_primary_key_constraint_name() {
+        assert_eq!(
+            postgres_plan(
+                vec![],
+                vec![IndexChange::Drop(IndexSchema {
+                    name: PRIMARY_INDEX_NAME.to_string(),
+                    columns: vec!["id".to_string()],
+                    unique: true,
+                    primary: true,
+                })],
+            ),
+            vec!["ALTER TABLE \"users\" DROP CONSTRAINT \"users_pkey\""]
+        );
+    }
+
+    #[test]
+    fn postgres_escapes_quotes_in_identifiers_and_literals() {
+        assert_eq!(
+            postgres_plan(
+                vec![ColumnChange::Add(ColumnSchema {
+                    name: "we\"ird".to_string(),
+                    col_type: "varchar".to_string(),
+                    nullable: false,
+                    default: Some("it's".to_string()),
+                    auto_increment: false,
+                })],
+                vec![],
+            ),
+            vec![
+                "ALTER TABLE \"users\" ADD COLUMN \"we\"\"ird\" varchar NOT NULL DEFAULT 'it''s'"
+            ]
+        );
     }
 
     #[test]

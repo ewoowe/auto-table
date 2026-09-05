@@ -67,7 +67,199 @@ pub async fn get_table_schema(
     match db.get_database_backend() {
         DbBackend::MySql => get_table_schema_mysql(db, table_name).await,
         DbBackend::Sqlite => get_table_schema_sqlite(db, table_name).await,
+        DbBackend::Postgres => get_table_schema_postgres(db, table_name).await,
         other => Err(TableError::UnsupportedBackend(other)),
+    }
+}
+
+/// Reads the current structure of `table_name` from a PostgreSQL database
+///
+/// Two things are handled here that make PostgreSQL differ from MySQL:
+///
+/// - `information_schema` reports its own spelling for several types, so they
+///   are rewritten to what sea-query emits (see [`normalize_postgres_type`]).
+/// - Constraint-backed indexes are named by PostgreSQL itself, as
+///   `<table>_pkey` and `<table>_<column>_key`. They are reported under a
+///   logical name instead, so they compare equal to what parsing the entity
+///   produces; the physical name is only needed when emitting DDL.
+pub async fn get_table_schema_postgres(
+    db: &DatabaseConnection,
+    table_name: &str,
+) -> Result<TableSchema, TableError> {
+    const COLUMNS_SQL: &str = "
+        SELECT column_name, data_type, is_nullable, column_default, is_identity
+        FROM information_schema.columns
+        WHERE table_schema = current_schema() AND table_name = $1
+        ORDER BY ordinal_position
+    ";
+    const INDEXES_SQL: &str = "
+        SELECT i.relname AS index_name,
+               a.attname AS column_name,
+               ix.indisunique AS is_unique,
+               ix.indisprimary AS is_primary,
+               (c.contype = 'u') AS is_unique_constraint,
+               array_position(ix.indkey, a.attnum) AS ordinal
+        FROM pg_class t
+        JOIN pg_index ix ON t.oid = ix.indrelid
+        JOIN pg_class i ON i.oid = ix.indexrelid
+        JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey)
+        LEFT JOIN pg_constraint c ON c.conindid = i.oid
+        WHERE t.relname = $1 AND t.relnamespace = current_schema()::regnamespace
+        ORDER BY i.relname, ordinal
+    ";
+
+    let fail = |source| TableError::QuerySchemaFailed {
+        table: table_name.to_string(),
+        source,
+    };
+
+    let column_rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            COLUMNS_SQL,
+            [Value::from(table_name)],
+        ))
+        .await
+        .map_err(fail)?;
+
+    let mut columns = Vec::with_capacity(column_rows.len());
+    for row in &column_rows {
+        let (Some(name), Some(col_type)) = (
+            row.try_get_by_index::<String>(0).ok(),
+            row.try_get_by_index::<String>(1).ok(),
+        ) else {
+            continue;
+        };
+
+        let nullable = row
+            .try_get_by_index::<String>(2)
+            .map(|value| value.eq_ignore_ascii_case("YES"))
+            .unwrap_or(false);
+        let default = row
+            .try_get_by_index::<String>(3)
+            .ok()
+            .and_then(|value| normalize_postgres_default(&value));
+        let identity = row
+            .try_get_by_index::<String>(4)
+            .map(|value| value.eq_ignore_ascii_case("YES"))
+            .unwrap_or(false);
+
+        columns.push(ColumnSchema {
+            name,
+            col_type: normalize_postgres_type(&col_type),
+            nullable,
+            default,
+            auto_increment: identity,
+        });
+    }
+
+    let index_rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            INDEXES_SQL,
+            [Value::from(table_name)],
+        ))
+        .await
+        .map_err(fail)?;
+
+    // The query orders by index name and then by position within the index, so
+    // consecutive rows sharing a name belong to the same index.
+    let mut grouped: Vec<(String, Vec<String>, bool, bool, bool)> = Vec::new();
+    for row in &index_rows {
+        let (Some(index_name), Some(column)) = (
+            row.try_get_by_index::<String>(0).ok(),
+            row.try_get_by_index::<String>(1).ok(),
+        ) else {
+            continue;
+        };
+
+        let unique = row.try_get_by_index::<bool>(2).unwrap_or(false);
+        let primary = row.try_get_by_index::<bool>(3).unwrap_or(false);
+        let is_unique_constraint = row.try_get_by_index::<bool>(4).unwrap_or(false);
+
+        match grouped.last_mut() {
+            Some(group) if group.0 == index_name => group.1.push(column),
+            _ => grouped.push((
+                index_name,
+                vec![column],
+                unique,
+                primary,
+                is_unique_constraint,
+            )),
+        }
+    }
+
+    let mut indexes = Vec::with_capacity(grouped.len());
+    for (index_name, columns, unique, primary, is_unique_constraint) in grouped {
+        let name = if primary {
+            PRIMARY_INDEX_NAME.to_string()
+        } else if is_unique_constraint {
+            // Match the name parsing the entity's CREATE TABLE produces
+            columns.join("_")
+        } else {
+            index_name
+        };
+
+        indexes.push(IndexSchema {
+            name,
+            columns,
+            unique,
+            primary,
+        });
+    }
+
+    Ok(TableSchema {
+        name: table_name.to_string(),
+        columns,
+        indexes,
+    })
+}
+
+/// Reduces a PostgreSQL `column_default` to the value it holds
+///
+/// PostgreSQL returns the default as an expression annotated with its type, so
+/// a `DEFAULT 'member'` comes back as `'member'::character varying`. Left
+/// untouched it would never compare equal to the value the entity declares.
+///
+/// Defaults that are not plain values, such as the `nextval(...)` behind a
+/// serial column, are reported as absent: they are generated by the database
+/// rather than declared by the entity.
+fn normalize_postgres_default(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    // Drop the `::type` annotation
+    let value = match value.find("::") {
+        Some(position) => value[..position].trim(),
+        None => value,
+    };
+
+    if value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2 {
+        let inner = &value[1..value.len() - 1];
+        return Some(inner.replace("''", "'"));
+    }
+
+    // An expression rather than a value: `nextval(...)`, `now()`, and friends
+    if value.contains('(') || value.contains(' ') {
+        return None;
+    }
+
+    Some(value.to_string())
+}
+
+/// Rewrites a PostgreSQL type into the spelling sea-query emits
+///
+/// PostgreSQL reports `varchar` as `character varying`, stores `decimal` as
+/// `numeric` and spells `bool` as `boolean`. Left alone, every string, decimal
+/// and boolean column would show up as a difference on every run.
+pub fn normalize_postgres_type(reported: &str) -> String {
+    match reported.trim().to_ascii_lowercase().as_str() {
+        "character varying" | "varchar" => "varchar".to_string(),
+        "numeric" | "decimal" => "decimal".to_string(),
+        "boolean" | "bool" => "bool".to_string(),
+        other => other.to_string(),
     }
 }
 

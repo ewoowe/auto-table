@@ -102,8 +102,8 @@ them idempotent — planning again after applying always yields nothing — and 
 means a failed run can simply be retried after fixing the data, since finished
 changes are not repeated.
 
-MySQL and SQLite are supported. PostgreSQL is not: its ALTER syntax splits a
-column change into several clauses, which needs a generator of its own.
+Migrations work on MySQL, SQLite and PostgreSQL. The statements they need
+differ per backend, as the sections below describe.
 
 ### 5. Concurrency (more than one instance)
 
@@ -215,6 +215,37 @@ Two sharp contrasts with MySQL:
 Bear in mind that rebuilding rewrites the whole table, which is expensive on
 large ones.
 
+#### PostgreSQL migration scenarios
+
+PostgreSQL splits a column change into **one statement per aspect**, rather
+than folding it into a single `MODIFY COLUMN` the way MySQL does:
+
+| Change | Statement |
+| --- | --- |
+| Add a column | `ALTER TABLE t ADD COLUMN "c" type [NOT NULL] [DEFAULT x]` |
+| Drop a column | `ALTER TABLE t DROP COLUMN "c"` |
+| Change the type | `ALTER TABLE t ALTER COLUMN "c" TYPE new_type` |
+| Tighten to `NOT NULL` | `ALTER TABLE t ALTER COLUMN "c" SET NOT NULL` |
+| Relax to nullable | `ALTER TABLE t ALTER COLUMN "c" DROP NOT NULL` |
+| Set a default | `ALTER TABLE t ALTER COLUMN "c" SET DEFAULT x` |
+| Drop a default | `ALTER TABLE t ALTER COLUMN "c" DROP DEFAULT` |
+| Add a unique constraint | `ALTER TABLE t ADD CONSTRAINT "t_c_key" UNIQUE ("c")` |
+| Drop a unique constraint | `ALTER TABLE t DROP CONSTRAINT "t_c_key"` |
+
+A change to one column can therefore produce several statements: changing both
+its type and its nullability emits two.
+
+Two more things need handling:
+
+- **Constraint names follow PostgreSQL.** The primary key is `<table>_pkey` and
+  a unique constraint is `<table>_<column>_key`. Structures are read under a
+  logical name and only turned back into the physical one when emitting DDL,
+  otherwise the two sides would never agree.
+- **Type names are normalized.** PostgreSQL reports `varchar` as `character
+  varying`, stores `decimal` as `numeric` and calls `bool` `boolean`; without
+  normalizing them, every string, decimal and boolean column looks like a
+  difference on every run.
+
 #### Risk classification (design draft, not implemented)
 
 Those dangers come in two kinds, and they should not be guarded the same way:
@@ -277,8 +308,7 @@ Two deliberate trade-offs:
 
 ## Supported backends
 
-Automatic table creation works with all three; **migrations cover MySQL and
-SQLite**.
+Automatic table creation and migrations work with all three.
 
 - MySQL
 - PostgreSQL

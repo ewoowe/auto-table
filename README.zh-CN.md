@@ -97,7 +97,7 @@ auto_table_core::apply_migrations(&db, &plan).await?;
 
 迁移是**声明式**的：每次都拿实体定义与数据库当前结构做 diff，而非按版本号依次执行。因此它是幂等的——执行完再生成一次计划必然为空；中途失败也可在修复数据后重跑，已完成的变更不会重复。
 
-目前支持 MySQL 与 SQLite。PostgreSQL 尚不支持——它的 ALTER 语法把一个列变更拆成多条子句，需要单独的生成器。
+MySQL、SQLite 与 PostgreSQL 三个后端均支持迁移。三者的语句生成方式不同，主要差异见下文各节。
 
 ### 5. 并发安全（多实例部署）
 
@@ -182,6 +182,29 @@ SQLite 既没有 `MODIFY COLUMN` 也没有 `ALTER COLUMN`，**列定义一旦建
 
 需要注意的是，重建表会重写整张表，在大表上代价较高。
 
+#### PostgreSQL 的迁移场景
+
+PostgreSQL 把列变更拆成**每个方面一条语句**，不像 MySQL 用一个 `MODIFY COLUMN` 囊括：
+
+| 变更 | 语句 |
+| --- | --- |
+| 新增列 | `ALTER TABLE t ADD COLUMN "c" 类型 [NOT NULL] [DEFAULT x]` |
+| 删除列 | `ALTER TABLE t DROP COLUMN "c"` |
+| 改变类型 | `ALTER TABLE t ALTER COLUMN "c" TYPE 新类型` |
+| 收紧为 `NOT NULL` | `ALTER TABLE t ALTER COLUMN "c" SET NOT NULL` |
+| 放宽为可空 | `ALTER TABLE t ALTER COLUMN "c" DROP NOT NULL` |
+| 设置默认值 | `ALTER TABLE t ALTER COLUMN "c" SET DEFAULT x` |
+| 去除默认值 | `ALTER TABLE t ALTER COLUMN "c" DROP DEFAULT` |
+| 新增唯一约束 | `ALTER TABLE t ADD CONSTRAINT "t_c_key" UNIQUE ("c")` |
+| 删除唯一约束 | `ALTER TABLE t DROP CONSTRAINT "t_c_key"` |
+
+所以一次列定义的变更可能产出多条语句，例如同时改类型与可空性会生成两条。
+
+另有两点需要处理：
+
+- **约束名遵循 PostgreSQL 的规则**：主键是 `<表>_pkey`，唯一约束是 `<表>_<列>_key`。读取结构时先换算成逻辑名再比对，生成语句时才还原为物理名——否则两者永远对不上。
+- **类型名做了归一**：PostgreSQL 把 `varchar` 报作 `character varying`、`decimal` 存作 `numeric`、`bool` 称作 `boolean`。不归一的话，字符串、小数与布尔列每次都会被误判为差异。
+
 #### 危险操作分级（设计中，尚未实现）
 
 两种"危险"性质不同，防护方式也不该相同：
@@ -228,7 +251,7 @@ apply_migrations(&db, &plan).allow_destructive().await?;
 
 ## 支持的后端
 
-自动建表支持以下三者，**迁移目前支持 MySQL 与 SQLite**。
+自动建表与迁移均支持以下三者。
 
 - MySQL
 - PostgreSQL
@@ -240,9 +263,9 @@ apply_migrations(&db, &plan).allow_destructive().await?;
 
 ## 路线图
 
-- [ ] **数据库迁移（migration）** — MySQL 已可用（见「4. 迁移已存在的表」），仍待完善：
+- [ ] **数据库迁移（migration）** — 三个后端均可用（见「4. 迁移已存在的表」），仍待完善：
   - 危险操作分级：删除列等不可逆操作需显式授权，未授权则拒绝执行整个计划（方案见上文「危险操作分级（设计中）」）
-  - 并发安全：多实例同时启动时通过数据库锁保证只有一个实例执行迁移（MySQL 用 `GET_LOCK`，SQLite 依赖写锁 + `busy_timeout`；已完成，见「5. 并发安全」）。PostgreSQL 的 `pg_advisory_lock` 随该后端的迁移一同引入
+  - 并发安全：多实例同时启动时通过数据库锁保证只有一个实例执行迁移（已完成：MySQL 用 `GET_LOCK`，SQLite 依赖写锁 + `busy_timeout`，PostgreSQL 用 `pg_advisory_lock`；见「5. 并发安全」）
 - [x] **SQLite 迁移（含重建表）** — SQLite 不支持 `MODIFY COLUMN`，故列定义变更与索引/约束变更都走「建新表 → 拷贝数据 → 删旧表 → 重命名」流程，在单个事务内完成、失败自动回滚（详见「SQLite 的迁移场景」）
 - [ ] 迁移回滚 — 本库迁移是声明式的（每次对比当前状态与目标状态），难以自动生成 down：`DROP COLUMN` 后数据已丢失，且 MySQL 的 DDL 不支持在事务中回滚（SQLite 则可以，已实测）。计划先落地「失败时按逆操作尽力回滚」，有损步骤明确报错而非静默继续
 - [x] 更细粒度的后端特性开关（按需启用 MySQL / PostgreSQL / SQLite）

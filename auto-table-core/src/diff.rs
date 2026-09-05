@@ -98,10 +98,12 @@ pub enum IndexChange {
     /// The index is declared but missing from the table
     Add(IndexSchema),
     /// The index exists in the table but is no longer declared
-    Drop {
-        /// Name of the obsolete index
-        name: String,
-    },
+    ///
+    /// It carries the whole index rather than just its name, because dropping
+    /// one needs more than the name: PostgreSQL drops a constraint instead of
+    /// an index when a unique constraint is behind it, and it needs to know
+    /// which kind it is dealing with.
+    Drop(IndexSchema),
 }
 
 /// Compares the structure an entity declares against the one in the database
@@ -195,9 +197,7 @@ fn diff_indexes(expected: &[IndexSchema], actual: &[IndexSchema]) -> Vec<IndexCh
                     // Recreating an index means dropping it first, and the Drop
                     // is emitted before the Add so a caller that applies the
                     // changes in order does the right thing.
-                    changes.push(IndexChange::Drop {
-                        name: current.name.clone(),
-                    });
+                    changes.push(IndexChange::Drop(current.clone()));
                     changes.push(IndexChange::Add(wanted.clone()));
                 }
             }
@@ -206,9 +206,7 @@ fn diff_indexes(expected: &[IndexSchema], actual: &[IndexSchema]) -> Vec<IndexCh
 
     for current in actual {
         if !matched.contains(&current.name.as_str()) {
-            changes.push(IndexChange::Drop {
-                name: current.name.clone(),
-            });
+            changes.push(IndexChange::Drop(current.clone()));
         }
     }
 
@@ -375,9 +373,7 @@ mod tests {
         assert_eq!(diff.indexes[0], IndexChange::Add(index("age", &["age"], false)));
         assert_eq!(
             diff.indexes[1],
-            IndexChange::Drop {
-                name: "legacy".to_string()
-            }
+            IndexChange::Drop(index("legacy", &["legacy"], false))
         );
     }
 
@@ -392,9 +388,7 @@ mod tests {
         assert_eq!(
             diff.indexes,
             vec![
-                IndexChange::Drop {
-                    name: "email".to_string()
-                },
+                IndexChange::Drop(index("email", &["email"], true)),
                 IndexChange::Add(index("email", &["email", "name"], true)),
             ]
         );
