@@ -16,6 +16,8 @@
 //! cargo test -p auto-table-core --test mysql_e2e
 //! ```
 
+#![cfg(feature = "mysql")]
+
 use std::sync::OnceLock;
 
 use auto_table_core::{
