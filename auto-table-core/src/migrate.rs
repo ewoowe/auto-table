@@ -16,6 +16,7 @@ use sea_orm::{
 use crate::diff::{diff_table, TableDiff};
 use crate::parse::parse_create_table;
 use crate::backend::AnyBackend;
+use crate::risk::{classify, Risk};
 use crate::schema::get_table_schema;
 use crate::{get_all_table_statements, get_existing_tables, get_table_name, Backend, TableError};
 
@@ -32,6 +33,8 @@ pub struct TableMigration {
     /// rebuilding the table. That is a sequence of destructive steps
     /// (`DROP TABLE` among them) which must either all happen or none of them.
     pub transactional: bool,
+    /// How dangerous the change is, so callers can refuse to apply it
+    pub risk: Risk,
 }
 
 impl TableMigration {
@@ -41,6 +44,7 @@ impl TableMigration {
             table,
             statements,
             transactional: false,
+            risk: Risk::Safe,
         }
     }
 
@@ -50,6 +54,7 @@ impl TableMigration {
             table,
             statements,
             transactional: true,
+            risk: Risk::Safe,
         }
     }
 }
@@ -59,12 +64,36 @@ impl TableMigration {
 pub struct MigrationPlan {
     /// One entry per table that needs to change
     pub tables: Vec<TableMigration>,
+    /// Whether destructive changes (e.g. dropping a column) may be applied
+    ///
+    /// `false` by default, so [`apply_migrations`] refuses any plan that
+    /// contains one until [`MigrationPlan::allow_destructive`] opts in.
+    pub allow_destructive: bool,
 }
 
 impl MigrationPlan {
     /// Whether anything has to change at all
     pub fn is_empty(&self) -> bool {
         self.tables.is_empty()
+    }
+
+    /// Allows destructive changes to be applied.
+    ///
+    /// By default [`apply_migrations`] refuses any plan that contains a
+    /// destructive change (such as dropping a column); call this only after the
+    /// change has been reviewed and approved.
+    pub fn allow_destructive(mut self) -> Self {
+        self.allow_destructive = true;
+        self
+    }
+
+    /// The worst risk anywhere in the plan
+    pub fn risk(&self) -> Risk {
+        self.tables
+            .iter()
+            .map(|table| table.risk)
+            .max()
+            .unwrap_or(Risk::Safe)
     }
 
     /// Every statement in the plan, in execution order
@@ -103,6 +132,11 @@ pub struct MigrateOptions {
     pub lock: LockBehavior,
     /// Seconds to wait for the lock; 0 returns immediately
     pub lock_timeout_secs: u32,
+    /// Whether destructive changes (e.g. dropping a column) may be applied
+    ///
+    /// `false` by default: a plan containing one is refused unless the plan
+    /// itself was built with [`MigrationPlan::allow_destructive`].
+    pub allow_destructive: bool,
 }
 
 impl Default for MigrateOptions {
@@ -110,6 +144,7 @@ impl Default for MigrateOptions {
         Self {
             lock: LockBehavior::None,
             lock_timeout_secs: 0,
+            allow_destructive: false,
         }
     }
 }
@@ -120,6 +155,7 @@ impl MigrateOptions {
         Self {
             lock: LockBehavior::Required,
             lock_timeout_secs: timeout_secs,
+            allow_destructive: false,
         }
     }
 
@@ -128,7 +164,16 @@ impl MigrateOptions {
         Self {
             lock: LockBehavior::SkipIfLocked,
             lock_timeout_secs: timeout_secs,
+            allow_destructive: false,
         }
+    }
+
+    /// Allow destructive changes (such as dropping a column) to be applied
+    ///
+    /// Only do this after the plan has been reviewed and approved.
+    pub fn allow_destructive(mut self) -> Self {
+        self.allow_destructive = true;
+        self
     }
 }
 
@@ -174,10 +219,15 @@ pub async fn plan_migrations(db: &DatabaseConnection) -> Result<MigrationPlan, T
             continue;
         }
 
-        tables.push(backend_impl.plan(&diff, &create_sql)?);
+        let mut migration = backend_impl.plan(&diff, &create_sql)?;
+        migration.risk = classify(&diff);
+        tables.push(migration);
     }
 
-    Ok(MigrationPlan { tables })
+    Ok(MigrationPlan {
+        tables,
+        allow_destructive: false,
+    })
 }
 
 /// Executes a plan, running its statements in order
@@ -223,6 +273,20 @@ pub async fn migrate(
 /// Under a lock the plan is rebuilt once the lock is held, so `plan` only
 /// decides whether migrating is worth attempting at all. Use [`migrate`] to
 /// plan and apply without building a plan twice.
+/// Refuses a plan that contains a destructive change unless `allow` is set
+fn ensure_allowed(plan: &MigrationPlan, allow: bool) -> Result<(), TableError> {
+    if allow || !plan.risk().is_destructive() {
+        return Ok(());
+    }
+    let tables: Vec<String> = plan
+        .tables
+        .iter()
+        .filter(|table| table.risk.is_destructive())
+        .map(|table| table.table.clone())
+        .collect();
+    Err(TableError::DestructiveChangesBlocked { tables })
+}
+
 pub async fn apply_migrations_with(
     db: &DatabaseConnection,
     plan: &MigrationPlan,
@@ -231,6 +295,10 @@ pub async fn apply_migrations_with(
     if plan.is_empty() {
         return Ok(MigrationOutcome::Applied);
     }
+
+    // Check first, run never: refuse any destructive change unless explicitly
+    // allowed, before a single statement executes.
+    ensure_allowed(plan, plan.allow_destructive || options.allow_destructive)?;
 
     if options.lock == LockBehavior::None {
         for migration in &plan.tables {
@@ -266,7 +334,9 @@ pub fn plan_table_migration(
     backend: DbBackend,
     create_sql: &str,
 ) -> Result<TableMigration, TableError> {
-    AnyBackend::for_backend(backend)?.plan(diff, create_sql)
+    let mut migration = AnyBackend::for_backend(backend)?.plan(diff, create_sql)?;
+    migration.risk = classify(diff);
+    Ok(migration)
 }
 
 // ---------------------------------------------------------------------------
@@ -353,6 +423,17 @@ async fn apply_under_lock(
     // instance may well have applied the very same changes, and replaying a
     // stale plan would only fail on statements already applied.
     let plan = plan_migrations(db).await?;
+
+    // Refuse a destructive plan unless explicitly allowed, releasing the lock and
+    // rolling back before returning.
+    if !options.allow_destructive {
+        if let Err(error) = ensure_allowed(&plan, false) {
+            backend.release_lock(&transaction).await?;
+            let _ = transaction.rollback().await;
+            run_outside(db, backend.after_statements()).await?;
+            return Err(error);
+        }
+    }
 
     // Already inside a transaction, so statements run as they are: a nested
     // transaction would not work on either backend.

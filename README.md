@@ -249,7 +249,7 @@ Two more things need handling:
   normalizing them, every string, decimal and boolean column looks like a
   difference on every run.
 
-#### Risk classification (design draft, not implemented)
+#### Risk classification
 
 Those dangers come in two kinds, and they should not be guarded the same way:
 
@@ -261,7 +261,7 @@ Those dangers come in two kinds, and they should not be guarded the same way:
   is gone with no way back**, on both backends.
 
 Only the second one needs human approval; the first only needs a warning. The
-proposed classification, with the MySQL and SQLite columns measured:
+classification, with all three backends measured:
 
 | Change | Risk | MySQL | SQLite | PostgreSQL |
 | --- | --- | --- | --- | --- |
@@ -276,7 +276,7 @@ proposed classification, with the MySQL and SQLite columns measured:
 | Add a unique index or constraint | Caution | errors while duplicates exist | rebuild fails and rolls back, table intact | errors while duplicates exist |
 | **Drop a column** | **Destructive** | **data lost for good, no rollback** | **data lost for good, no rollback** | **data lost for good** |
 
-Proposed API (not implemented, still subject to change):
+API:
 
 ```rust
 // Every change can report its own risk
@@ -285,8 +285,11 @@ pub enum Risk { Safe, Caution, Destructive }
 // Default: refuse to run anything if the plan contains a destructive change
 apply_migrations(&db, &plan).await?;
 
-// Run it only after an explicit approval
-apply_migrations(&db, &plan).allow_destructive().await?;
+// Run it only after explicit approval
+apply_migrations(&db, &plan.allow_destructive()).await?;
+
+// Equivalently, via the options builder used by `migrate`:
+apply_migrations_with(&db, &plan, MigrateOptions::allow_destructive()).await?;
 ```
 
 Two deliberate trade-offs:
@@ -306,7 +309,10 @@ Two deliberate trade-offs:
 > SQLite (unless the table is empty), whereas MySQL silently fills existing rows
 > with `''` or `0`.
 
-> This section is a design draft and is not implemented yet.
+> Implemented: a plan that drops a column is refused by `apply_migrations` unless
+> one of the `allow_destructive` opt-ins is used. The `drops_a_column_*` end-to-end
+> tests exercise exactly this — a default apply is rejected with
+> `TableError::DestructiveChangesBlocked`, and only `allow_destructive` makes it run.
 
 ## Supported backends
 
@@ -323,7 +329,7 @@ The core library exposes a precise [`auto_table_core::TableError`](auto-table-co
 ## Roadmap
 
 - [x] **Database migrations** — available on MySQL, SQLite and PostgreSQL (see "4. Migrating tables that already exist" and "PostgreSQL migration scenarios"). The concurrency lock uses each backend's native mechanism — MySQL `GET_LOCK`, SQLite its write lock plus a `busy_timeout`, PostgreSQL `pg_advisory_lock` (see "5. Concurrency") — and the plan is re-planned after the lock is taken so a stale plan is never replayed.
-  - Risk classification (see the design draft in "Risk classification") is not yet enforced: dropping a column is still destructive and is only protected once the proposed approval API lands.
+  - Risk classification (see "Risk classification") is now enforced: `apply_migrations` refuses any plan that drops a column unless `allow_destructive` is set, and the plan reports its worst risk through [`MigrationPlan::risk`].
 - [x] **SQLite migrations (including table rebuild)** — SQLite has no `MODIFY COLUMN`, so changes to a column definition and to indexes or constraints go through "create new table → copy data → drop old → rename", inside a single transaction that rolls back on failure (see "SQLite migration scenarios")
 - [ ] Rollback (down migration) support — migrations here are declarative (diff the current state against the target state), so a `down` cannot be generated reliably: data is already gone after `DROP COLUMN`, and MySQL DDL does not roll back inside a transaction (SQLite does, verified). Plan: first ship "best-effort rollback via reverse operations on failure", and make lossy steps fail loudly instead of silently continuing
 - [x] Finer-grained backend feature flags (opt-in MySQL / PostgreSQL / SQLite)

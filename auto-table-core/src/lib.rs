@@ -25,6 +25,7 @@ pub mod backend;
 pub mod diff;
 pub mod migrate;
 pub mod parse;
+pub mod risk;
 pub mod schema;
 
 pub use backend::{backend_for, AnyBackend};
@@ -37,6 +38,7 @@ pub use migrate::{
     TableMigration,
 };
 pub use parse::{parse_create_table, ParseError, PRIMARY_INDEX_NAME};
+pub use risk::{classify, Risk};
 pub use schema::{get_table_schema, ColumnSchema, IndexSchema, TableSchema};
 
 /// Errors related to automatic table creation (precise library-level error type)
@@ -99,6 +101,14 @@ pub enum TableError {
     MigrationLockNotAcquired {
         /// How long we waited before giving up
         timeout_secs: u32,
+    },
+    /// The plan contained a destructive change (e.g. dropping a column) and was
+    /// refused because it was not explicitly allowed. Opt in with
+    /// [`MigrationPlan::allow_destructive`] or [`MigrateOptions::allow_destructive`].
+    #[error("refusing to apply a destructive migration (dropping columns from: {tables:?}) without explicit approval")]
+    DestructiveChangesBlocked {
+        /// Tables whose plan drops one or more columns
+        tables: Vec<String>,
     },
 }
 

@@ -11,7 +11,7 @@
 
 use std::path::PathBuf;
 
-use auto_table_core::{apply_migrations, create_missing_tables, plan_migrations, MigrationPlan};
+use auto_table_core::{apply_migrations, create_missing_tables, plan_migrations, MigrationPlan, TableError};
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
 
 /// A database in its own temporary directory, removed when the test finishes
@@ -70,6 +70,31 @@ async fn check_and_apply(db: &DatabaseConnection, table: &str, expected: &[&str]
     assert_eq!(statements, expected, "unexpected statements for `{table}`");
 
     apply_migrations(db, &plan).await.expect("apply the plan");
+
+    let plan = plan_migrations(db).await.expect("plan again after applying");
+    assert!(
+        statements_for(&plan, table).is_empty(),
+        "`{table}` is not idempotent, it still plans: {:?}",
+        statements_for(&plan, table)
+    );
+}
+
+/// Like [`check_and_apply`] but for a destructive plan: applying it without
+/// approval must be refused, and only `allow_destructive` lets it run and converge.
+async fn check_and_apply_destructive(db: &DatabaseConnection, table: &str, expected: &[&str]) {
+    let plan = plan_migrations(db).await.expect("plan the migration");
+    let statements = statements_for(&plan, table);
+    assert_eq!(statements, expected, "unexpected statements for `{table}`");
+
+    let blocked = apply_migrations(db, &plan).await;
+    assert!(
+        matches!(blocked, Err(TableError::DestructiveChangesBlocked { .. })),
+        "destructive change must be blocked by default, got {blocked:?}"
+    );
+
+    apply_migrations(db, &plan.allow_destructive())
+        .await
+        .expect("apply the plan after allowing destructive changes");
 
     let plan = plan_migrations(db).await.expect("plan again after applying");
     assert!(
@@ -297,7 +322,7 @@ async fn drops_a_column_without_rebuilding() {
     )
     .await;
 
-    check_and_apply(
+    check_and_apply_destructive(
         &db.db,
         "e2e_sqlite_drop_column",
         &["ALTER TABLE \"e2e_sqlite_drop_column\" DROP COLUMN \"obsolete\""],

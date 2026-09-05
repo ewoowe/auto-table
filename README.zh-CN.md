@@ -206,14 +206,14 @@ PostgreSQL 把列变更拆成**每个方面一条语句**，不像 MySQL 用一�
 - **约束名遵循 PostgreSQL 的规则**：主键是 `<表>_pkey`，唯一约束是 `<表>_<列>_key`。读取结构时先换算成逻辑名再比对，生成语句时才还原为物理名——否则两者永远对不上。
 - **类型名做了归一**：PostgreSQL 把 `varchar` 报作 `character varying`、`decimal` 存作 `numeric`、`bool` 称作 `boolean`。不归一的话，字符串、小数与布尔列每次都会被误判为差异。
 
-#### 危险操作分级（设计中，尚未实现）
+#### 危险操作分级
 
 两种"危险"性质不同，防护方式也不该相同：
 
 - **Caution（可能失败）**：迁移被拒绝——MySQL 在严格模式下整条语句失败，SQLite 则是重建失败并整体回滚，**两者的数据都原封不动**。它们不会毁数据，只会让迁移中断。
 - **Destructive（可能毁数据）**：无条件成功、**数据永久丢失且无法撤销**，两个后端皆是如此。
 
-只有后者需要人工授权，前者只需要提示。拟定分级如下，MySQL 与 SQLite 两列均为实测结果：
+只有后者需要人工授权，前者只需要提示。分级如下，三后端均为实测结果：
 
 | 变更 | 级别 | MySQL | SQLite | PostgreSQL |
 | --- | --- | --- | --- | --- |
@@ -228,7 +228,7 @@ PostgreSQL 把列变更拆成**每个方面一条语句**，不像 MySQL 用一�
 | 新增唯一索引/约束 | Caution | 存在重复值时报错 | 重建失败并回滚，原表完好 | 存在重复值时报错 |
 | **删除列** | **Destructive** | **数据永久丢失，不可回滚** | **数据永久丢失，不可回滚** | **数据永久丢失** |
 
-拟定的 API（尚未实现，仍可能调整）：
+API：
 
 ```rust
 // 每个变更可自报风险
@@ -238,7 +238,10 @@ pub enum Risk { Safe, Caution, Destructive }
 apply_migrations(&db, &plan).await?;
 
 // 显式授权后才执行
-apply_migrations(&db, &plan).allow_destructive().await?;
+apply_migrations(&db, &plan.allow_destructive()).await?;
+
+// 也可通过 migrate 所用的 options 构造器：
+apply_migrations_with(&db, &plan, MigrateOptions::allow_destructive()).await?;
 ```
 
 两处设计取舍：
@@ -248,7 +251,7 @@ apply_migrations(&db, &plan).allow_destructive().await?;
 
 > PostgreSQL 现已完整支持并实测。一个值得注意的分歧：「新增 `NOT NULL` 列但无默认值」在 PostgreSQL 与 SQLite 中都会**报错**（除非表为空），而 MySQL 会静默把已有行填成 `''` 或 `0`。
 
-> 本节为设计草案，尚未实现。
+> 已实现：只要计划中包含删列，默认 `apply_migrations` 就会拒绝执行，并返回 `TableError::DestructiveChangesBlocked`；只有 `allow_destructive` 显式授权才会真正执行。端到端测试 `drops_a_column_*` 正是覆盖这一行为——默认应用被拒，授权后才成功并收敛。
 
 ## 支持的后端
 

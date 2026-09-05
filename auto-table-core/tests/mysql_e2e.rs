@@ -99,6 +99,31 @@ async fn check_and_apply(db: &DatabaseConnection, table: &str, expected: &[&str]
     );
 }
 
+/// Like [`check_and_apply`] but for a destructive plan: applying it without
+/// approval must be refused, and only `allow_destructive` lets it run and converge.
+async fn check_and_apply_destructive(db: &DatabaseConnection, table: &str, expected: &[&str]) {
+    let plan = plan_migrations(db).await.expect("plan the migration");
+    let statements = statements_for(&plan, table);
+    assert_eq!(statements, expected, "unexpected statements for `{table}`");
+
+    let blocked = apply_migrations(db, &plan).await;
+    assert!(
+        matches!(blocked, Err(TableError::DestructiveChangesBlocked { .. })),
+        "destructive change must be blocked by default, got {blocked:?}"
+    );
+
+    apply_migrations(db, &plan.allow_destructive())
+        .await
+        .expect("apply the plan after allowing destructive changes");
+
+    let plan = plan_migrations(db).await.expect("plan again after applying");
+    assert!(
+        statements_for(&plan, table).is_empty(),
+        "`{table}` is not idempotent, it still plans: {:?}",
+        statements_for(&plan, table)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Entities under test. Each one owns a separate table so the scenarios do not
 // interfere. All of them are registered through `#[auto_table]`.
@@ -350,7 +375,7 @@ async fn drops_a_column_the_entity_no_longer_declares() {
     )
     .await;
 
-    check_and_apply(
+    check_and_apply_destructive(
         &db,
         "e2e_drop_column",
         &["ALTER TABLE `e2e_drop_column` DROP COLUMN `obsolete`"],
