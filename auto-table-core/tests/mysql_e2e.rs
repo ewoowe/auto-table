@@ -618,6 +618,52 @@ async fn a_stale_plan_is_not_replayed_when_the_lock_is_taken() {
     );
 }
 
+/// `migrate` plans behind the lock, so it only has to plan once
+#[tokio::test]
+async fn migrate_plans_and_applies_in_one_step() {
+    let _guard = serial().await;
+    let db = connect().await;
+
+    create_legacy_table(
+        &db,
+        "e2e_add_column",
+        "`id` int NOT NULL PRIMARY KEY AUTO_INCREMENT, `email` varchar(255) NOT NULL",
+    )
+    .await;
+
+    let outcome = auto_table_core::migrate(&db, MigrateOptions::locked(0))
+        .await
+        .expect("migrate");
+    assert_eq!(outcome, MigrationOutcome::Applied);
+
+    let plan = plan_migrations(&db).await.expect("plan again");
+    assert!(
+        statements_for(&plan, "e2e_add_column").is_empty(),
+        "migrate must have applied everything"
+    );
+}
+
+/// Nothing to do means no lock is needed
+#[tokio::test]
+async fn migrate_does_nothing_when_the_database_is_in_sync() {
+    let _guard = serial().await;
+    let db = connect().await;
+
+    create_missing_tables(&db).await.expect("create the missing tables");
+    loop {
+        let plan = plan_migrations(&db).await.expect("plan");
+        if plan.is_empty() {
+            break;
+        }
+        apply_migrations(&db, &plan).await.expect("apply");
+    }
+
+    let outcome = auto_table_core::migrate(&db, MigrateOptions::locked(0))
+        .await
+        .expect("migrate");
+    assert_eq!(outcome, MigrationOutcome::Applied);
+}
+
 #[tokio::test]
 async fn a_fully_migrated_database_plans_nothing() {
     let _guard = serial().await;

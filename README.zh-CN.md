@@ -104,16 +104,18 @@ auto_table_core::apply_migrations(&db, &plan).await?;
 多个实例同时启动时若都去迁移，后到的会重复执行已被应用的语句而失败。加锁可以避免：
 
 ```rust
-use auto_table_core::{apply_migrations_with, MigrateOptions};
+use auto_table_core::{migrate, MigrateOptions};
 
 // 拿不到锁就等待，超时则报错
-apply_migrations_with(&db, &plan, MigrateOptions::locked(10)).await?;
+migrate(&db, MigrateOptions::locked(10)).await?;
 
 // 拿不到锁就跳过——反正另一个实例正在应用同样的变更
-apply_migrations_with(&db, &plan, MigrateOptions::skip_if_locked(0)).await?;
+migrate(&db, MigrateOptions::skip_if_locked(0)).await?;
 ```
 
 默认的 `apply_migrations` **不加锁**，与先前行为一致；单实例部署无需关心。
+
+**加锁时请用 `migrate`，而不是先 `plan_migrations` 再 `apply_migrations_with`**。`migrate` 在**拿到锁之后**才生成计划，因此只规划一次、且计划不会过期；先规划再执行的话，为了保证安全仍需在锁内重新规划一次，等于做了两遍。`plan_migrations` 仍应单独使用的场景只有一种——你想在执行前先看看语句是什么（即 dry-run）。
 
 两点实现说明：
 

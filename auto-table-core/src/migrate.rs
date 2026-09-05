@@ -189,11 +189,37 @@ pub async fn apply_migrations(
     Ok(())
 }
 
-/// Executes a plan, optionally holding a lock while doing so
+/// Plans and applies migrations in one step
+///
+/// This is the entry point to prefer. Under a lock the plan is built *after*
+/// the lock is taken, so it is built once and cannot go stale: building it
+/// beforehand would mean either trusting a plan that may already be outdated,
+/// or building it a second time behind the lock.
+///
+/// Reach for [`plan_migrations`] separately only when the statements should be
+/// reviewed before anything runs.
+pub async fn migrate(
+    db: &DatabaseConnection,
+    options: MigrateOptions,
+) -> Result<MigrationOutcome, TableError> {
+    match options.lock {
+        LockBehavior::None => {
+            let plan = plan_migrations(db).await?;
+            apply_migrations_with(db, &plan, options).await
+        }
+        LockBehavior::Required | LockBehavior::SkipIfLocked => apply_under_lock(db, options).await,
+    }
+}
+
+/// Executes an already built plan, optionally holding a lock while doing so
 ///
 /// Without a lock, two instances starting together apply the same statements
 /// and the slower one fails on statements the faster one already ran. With a
 /// lock, only the instance holding it migrates.
+///
+/// Under a lock the plan is rebuilt once the lock is held, so `plan` only
+/// decides whether migrating is worth attempting at all. Use [`migrate`] to
+/// plan and apply without building a plan twice.
 pub async fn apply_migrations_with(
     db: &DatabaseConnection,
     plan: &MigrationPlan,

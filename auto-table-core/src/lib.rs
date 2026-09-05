@@ -30,7 +30,7 @@ pub use diff::{
     diff_table, ColumnAspect, ColumnChange, IndexChange, TableDiff,
 };
 pub use migrate::{
-    apply_migrations, apply_migrations_with, plan_migrations, plan_table_migration,
+    apply_migrations, apply_migrations_with, migrate, plan_migrations, plan_table_migration,
     plan_table_statements, LockBehavior, MigrateOptions, MigrationOutcome, MigrationPlan,
     TableMigration,
 };

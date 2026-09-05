@@ -111,17 +111,24 @@ If several instances start at once and all try to migrate, the ones that arrive
 later re-run statements that are already applied and fail. A lock prevents it:
 
 ```rust
-use auto_table_core::{apply_migrations_with, MigrateOptions};
+use auto_table_core::{migrate, MigrateOptions};
 
 // Wait for the lock, and fail if the wait runs out
-apply_migrations_with(&db, &plan, MigrateOptions::locked(10)).await?;
+migrate(&db, MigrateOptions::locked(10)).await?;
 
 // Skip instead: another instance is applying the very same changes
-apply_migrations_with(&db, &plan, MigrateOptions::skip_if_locked(0)).await?;
+migrate(&db, MigrateOptions::skip_if_locked(0)).await?;
 ```
 
 `apply_migrations` takes **no lock**, keeping the previous behaviour; a single
 instance needs none.
+
+**Prefer `migrate` over planning first and then applying.** `migrate` builds the
+plan *after* the lock is held, so it plans once and the plan cannot be stale;
+planning beforehand means either trusting a plan that may already be outdated or
+building it a second time behind the lock. `plan_migrations` on its own is for
+the one case where it is still worth it: reviewing the statements before
+anything runs.
 
 Two notes on how it works:
 
