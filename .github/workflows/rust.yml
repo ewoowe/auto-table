@@ -13,8 +13,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
-    # The MySQL and PostgreSQL end-to-end tests need real servers. SQLite needs
-    # none: it uses the bundled engine against a temporary file.
+    # The MySQL and PostgreSQL end-to-end tests need real servers.
     services:
       mysql:
         image: mysql:8.0
@@ -49,7 +48,20 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      # --all-features so the SQLite and PostgreSQL end-to-end tests are compiled in
-      run: cargo test --all-features --verbose
+      run: cargo build --features "mysql postgres" --verbose
+    - name: Run MySQL and PostgreSQL e2e tests
+      # Runs the core unit tests (mysql/postgres gated) plus mysql_e2e and
+      # pg_e2e. SQLite is exercised by the separate test-sqlite job below.
+      run: cargo test --features "mysql postgres" --verbose
+
+  test-sqlite:
+    runs-on: ubuntu-latest
+
+    # SQLite ships a bundled copy of the engine and every test runs against its
+    # own temporary file, so it needs no external service.
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build
+      run: cargo build -p auto-table-core --no-default-features --features sqlite --verbose
+    - name: Run SQLite e2e tests
+      run: cargo test -p auto-table-core --no-default-features --features sqlite --verbose
