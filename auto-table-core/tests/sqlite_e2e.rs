@@ -459,3 +459,157 @@ async fn a_fully_migrated_database_plans_nothing() {
         "a fully migrated database must plan nothing, got: {plan:?}"
     );
 }
+
+
+// --- enriched scenarios: every migration kind against a real (bundled) engine ---
+
+/// `role` is added with a default value
+mod not_null_default {
+    use auto_table_core::auto_table;
+    use sea_orm::entity::prelude::*;
+
+    #[auto_table]
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "e2e_sqlite_notnull_default")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = true)]
+        pub id: i32,
+        pub email: String,
+        #[sea_orm(default_value = "member")]
+        pub role: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+/// The table no longer wants the index on `bio`
+mod drop_index {
+    use auto_table_core::auto_table;
+    use sea_orm::entity::prelude::*;
+
+    #[auto_table]
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "e2e_sqlite_drop_index")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = true)]
+        pub id: i32,
+        pub email: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+/// `role` gains a default value
+mod change_default {
+    use auto_table_core::auto_table;
+    use sea_orm::entity::prelude::*;
+
+    #[auto_table]
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "e2e_sqlite_change_default")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = true)]
+        pub id: i32,
+        pub email: String,
+        #[sea_orm(default_value = "member")]
+        pub role: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+#[tokio::test]
+async fn adds_a_not_null_column_with_a_default() {
+    let db = TempDb::new("notnull_default").await;
+
+    create_legacy_table(
+        &db.db,
+        "e2e_sqlite_notnull_default",
+        "\"id\" integer NOT NULL PRIMARY KEY AUTOINCREMENT, \"email\" varchar NOT NULL",
+    )
+    .await;
+
+    check_and_apply(
+        &db.db,
+        "e2e_sqlite_notnull_default",
+        &["ALTER TABLE \"e2e_sqlite_notnull_default\" ADD COLUMN \"role\" TEXT NOT NULL DEFAULT 'member'"],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn drops_an_index_by_rebuilding() {
+    let db = TempDb::new("drop_index").await;
+
+    create_legacy_table(
+        &db.db,
+        "e2e_sqlite_drop_index",
+        "\"id\" integer NOT NULL PRIMARY KEY AUTOINCREMENT, \"email\" varchar NOT NULL",
+    )
+    .await;
+    db.db
+        .execute_unprepared("CREATE INDEX \"email\" ON \"e2e_sqlite_drop_index\" (\"email\")")
+        .await
+        .expect("create the legacy index");
+
+    // Dropping an index rebuilds the table on SQLite
+    let plan = plan_migrations(&db.db).await.expect("plan the migration");
+    let statements = statements_for(&plan, "e2e_sqlite_drop_index");
+    assert!(
+        statements.iter().any(|sql| sql.contains("__auto_table_rebuild")),
+        "dropping an index must rebuild the table, got: {statements:?}"
+    );
+
+    apply_migrations(&db.db, &plan).await.expect("apply the plan");
+
+    let plan = plan_migrations(&db.db).await.expect("plan again");
+    assert!(
+        statements_for(&plan, "e2e_sqlite_drop_index").is_empty(),
+        "the rebuilt table must match the entity"
+    );
+
+    // And the index really is gone
+    let count = scalar(
+        &db.db,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'email'",
+    )
+    .await;
+    assert_eq!(count, 0, "the index must have been dropped");
+}
+
+#[tokio::test]
+async fn changes_a_default_value_by_rebuilding() {
+    let db = TempDb::new("change_default").await;
+
+    create_legacy_table(
+        &db.db,
+        "e2e_sqlite_change_default",
+        "\"id\" integer NOT NULL PRIMARY KEY AUTOINCREMENT, \"email\" varchar NOT NULL, \"role\" varchar NOT NULL",
+    )
+    .await;
+
+    let plan = plan_migrations(&db.db).await.expect("plan the migration");
+    assert!(
+        statements_for(&plan, "e2e_sqlite_change_default")
+            .iter()
+            .any(|sql| sql.contains("__auto_table_rebuild")),
+        "changing a default must rebuild the table"
+    );
+
+    apply_migrations(&db.db, &plan).await.expect("apply the plan");
+
+    let plan = plan_migrations(&db.db).await.expect("plan again");
+    assert!(
+        statements_for(&plan, "e2e_sqlite_change_default").is_empty(),
+        "the rebuilt table must match the entity"
+    );
+}

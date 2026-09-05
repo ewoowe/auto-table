@@ -686,3 +686,172 @@ async fn a_fully_migrated_database_plans_nothing() {
         "a fully migrated database must plan nothing, got: {plan:?}"
     );
 }
+
+
+// --- enriched scenarios: every migration kind against a real server ---
+
+/// `role` is added with a default value
+mod not_null_default {
+    use auto_table_core::auto_table;
+    use sea_orm::entity::prelude::*;
+
+    #[auto_table]
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "e2e_mysql_notnull_default")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = true)]
+        pub id: i32,
+        pub email: String,
+        #[sea_orm(default_value = "member")]
+        pub role: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+/// `role` is added as a required column without a default
+mod not_null_no_default {
+    use auto_table_core::auto_table;
+    use sea_orm::entity::prelude::*;
+
+    #[auto_table]
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "e2e_mysql_notnull_nodefault")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = true)]
+        pub id: i32,
+        pub email: String,
+        pub role: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+/// The table no longer wants the plain index on `bio`
+mod drop_plain_index {
+    use auto_table_core::auto_table;
+    use sea_orm::entity::prelude::*;
+
+    #[auto_table]
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "e2e_mysql_drop_plain_index")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = true)]
+        pub id: i32,
+        pub email: String,
+        pub bio: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+/// `id` gains AUTO_INCREMENT
+mod add_auto_increment {
+    use auto_table_core::auto_table;
+    use sea_orm::entity::prelude::*;
+
+    #[auto_table]
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "e2e_mysql_autoinc")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = true)]
+        pub id: i32,
+        pub email: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+#[tokio::test]
+async fn adds_a_not_null_column_with_a_default() {
+    let _guard = serial().await;
+    let db = connect().await;
+
+    create_legacy_table(
+        &db,
+        "e2e_mysql_notnull_default",
+        "`id` int NOT NULL AUTO_INCREMENT, `email` varchar(255) NOT NULL, PRIMARY KEY (`id`)",
+    )
+    .await;
+
+    check_and_apply(
+        &db,
+        "e2e_mysql_notnull_default",
+        &["ALTER TABLE `e2e_mysql_notnull_default` ADD COLUMN `role` varchar(255) NOT NULL DEFAULT 'member'"],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn adds_a_required_column_without_a_default() {
+    let _guard = serial().await;
+    let db = connect().await;
+
+    create_legacy_table(
+        &db,
+        "e2e_mysql_notnull_nodefault",
+        "`id` int NOT NULL AUTO_INCREMENT, `email` varchar(255) NOT NULL, PRIMARY KEY (`id`)",
+    )
+    .await;
+
+    // Under MySQL's strict mode the missing default is filled silently rather
+    // than rejected, which is exactly the "Caution" row in the risk table.
+    check_and_apply(
+        &db,
+        "e2e_mysql_notnull_nodefault",
+        &["ALTER TABLE `e2e_mysql_notnull_nodefault` ADD COLUMN `role` varchar(255) NOT NULL"],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn drops_a_plain_index() {
+    let _guard = serial().await;
+    let db = connect().await;
+
+    create_legacy_table(
+        &db,
+        "e2e_mysql_drop_plain_index",
+        "`id` int NOT NULL AUTO_INCREMENT, `email` varchar(255) NOT NULL, `bio` varchar(255) NOT NULL, PRIMARY KEY (`id`), INDEX `bio` (`bio`)",
+    )
+    .await;
+
+    check_and_apply(
+        &db,
+        "e2e_mysql_drop_plain_index",
+        &["ALTER TABLE `e2e_mysql_drop_plain_index` DROP INDEX `bio`"],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn adds_auto_increment_to_a_primary_key() {
+    let _guard = serial().await;
+    let db = connect().await;
+
+    create_legacy_table(
+        &db,
+        "e2e_mysql_autoinc",
+        "`id` int NOT NULL PRIMARY KEY, `email` varchar(255) NOT NULL",
+    )
+    .await;
+
+    check_and_apply(
+        &db,
+        "e2e_mysql_autoinc",
+        &["ALTER TABLE `e2e_mysql_autoinc` MODIFY COLUMN `id` int NOT NULL AUTO_INCREMENT"],
+    )
+    .await;
+}
