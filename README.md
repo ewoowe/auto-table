@@ -105,6 +105,38 @@ changes are not repeated.
 MySQL and SQLite are supported. PostgreSQL is not: its ALTER syntax splits a
 column change into several clauses, which needs a generator of its own.
 
+### 5. Concurrency (more than one instance)
+
+If several instances start at once and all try to migrate, the ones that arrive
+later re-run statements that are already applied and fail. A lock prevents it:
+
+```rust
+use auto_table_core::{apply_migrations_with, MigrateOptions};
+
+// Wait for the lock, and fail if the wait runs out
+apply_migrations_with(&db, &plan, MigrateOptions::locked(10)).await?;
+
+// Skip instead: another instance is applying the very same changes
+apply_migrations_with(&db, &plan, MigrateOptions::skip_if_locked(0)).await?;
+```
+
+`apply_migrations` takes **no lock**, keeping the previous behaviour; a single
+instance needs none.
+
+Two notes on how it works:
+
+- **MySQL** uses the named lock `GET_LOCK`. It is a *session* lock, so the whole
+  migration runs inside one transaction to pin it to a connection — otherwise
+  the lock would guard nothing. The lock name includes the database, so two
+  databases on one server do not block each other.
+- **SQLite** has no named locks and relies on its own write lock; taking the
+  lock only adds a `busy_timeout` so a concurrent instance queues instead of
+  failing immediately with `SQLITE_BUSY`.
+
+On both backends the plan is **rebuilt after the lock is taken**: while waiting
+for the lock, another instance may well have finished migrating, and replaying a
+stale plan would only fail.
+
 For finer-grained control the building blocks are public as well:
 
 - [`get_table_schema`](auto-table-core/src/schema.rs) — read the current structure of a table
@@ -253,7 +285,7 @@ The core library exposes a precise [`auto_table_core::TableError`](auto-table-co
 
 - [ ] **Database migrations** — available on MySQL already (see "4. Migrating tables that already exist"), still to be completed:
   - Risk classification: irreversible changes such as dropping a column require explicit approval, otherwise the entire plan is refused (see the design draft above)
-  - Concurrency safety: when several instances start at once, a database lock (`GET_LOCK` / `pg_advisory_lock` / an exclusive SQLite transaction) ensures only one of them migrates
+  - Concurrency safety: a database lock keeps all but one instance from migrating at once (done for MySQL with `GET_LOCK` and for SQLite with its write lock plus a `busy_timeout`; see "5. Concurrency"). PostgreSQL's `pg_advisory_lock` arrives with migration support for that backend
 - [x] **SQLite migrations (including table rebuild)** — SQLite has no `MODIFY COLUMN`, so changes to a column definition and to indexes or constraints go through "create new table → copy data → drop old → rename", inside a single transaction that rolls back on failure (see "SQLite migration scenarios")
 - [ ] Rollback (down migration) support — migrations here are declarative (diff the current state against the target state), so a `down` cannot be generated reliably: data is already gone after `DROP COLUMN`, and MySQL DDL does not roll back inside a transaction (SQLite does, verified). Plan: first ship "best-effort rollback via reverse operations on failure", and make lossy steps fail loudly instead of silently continuing
 - [x] Finer-grained backend feature flags (opt-in MySQL / PostgreSQL / SQLite)

@@ -99,6 +99,29 @@ auto_table_core::apply_migrations(&db, &plan).await?;
 
 目前支持 MySQL 与 SQLite。PostgreSQL 尚不支持——它的 ALTER 语法把一个列变更拆成多条子句，需要单独的生成器。
 
+### 5. 并发安全（多实例部署）
+
+多个实例同时启动时若都去迁移，后到的会重复执行已被应用的语句而失败。加锁可以避免：
+
+```rust
+use auto_table_core::{apply_migrations_with, MigrateOptions};
+
+// 拿不到锁就等待，超时则报错
+apply_migrations_with(&db, &plan, MigrateOptions::locked(10)).await?;
+
+// 拿不到锁就跳过——反正另一个实例正在应用同样的变更
+apply_migrations_with(&db, &plan, MigrateOptions::skip_if_locked(0)).await?;
+```
+
+默认的 `apply_migrations` **不加锁**，与先前行为一致；单实例部署无需关心。
+
+两点实现说明：
+
+- **MySQL** 使用命名锁 `GET_LOCK`。它是**会话级**的，因此整个迁移在单个事务内执行以固定连接，否则锁形同虚设。锁名附带数据库名，同一实例上的不同库互不阻塞。
+- **SQLite** 没有命名锁，依赖其自身的写锁；加锁只是额外设置一个 `busy_timeout`，让并发实例排队而不是立刻收到 `SQLITE_BUSY`。
+
+无论哪种后端，**拿到锁之后都会重新生成一次计划**：等待锁的这段时间里另一个实例可能已经迁移完毕，重放过期计划只会失败。
+
 若需要更细粒度的控制，也可以直接使用这些构件自行组装：
 
 - [`get_table_schema`](auto-table-core/src/schema.rs) —— 读取某张表当前的结构
@@ -217,7 +240,7 @@ apply_migrations(&db, &plan).allow_destructive().await?;
 
 - [ ] **数据库迁移（migration）** — MySQL 已可用（见「4. 迁移已存在的表」），仍待完善：
   - 危险操作分级：删除列等不可逆操作需显式授权，未授权则拒绝执行整个计划（方案见上文「危险操作分级（设计中）」）
-  - 并发安全：多实例同时启动时通过数据库锁（`GET_LOCK` / `pg_advisory_lock` / SQLite 独占事务）保证只有一个实例执行迁移
+  - 并发安全：多实例同时启动时通过数据库锁保证只有一个实例执行迁移（MySQL 用 `GET_LOCK`，SQLite 依赖写锁 + `busy_timeout`；已完成，见「5. 并发安全」）。PostgreSQL 的 `pg_advisory_lock` 随该后端的迁移一同引入
 - [x] **SQLite 迁移（含重建表）** — SQLite 不支持 `MODIFY COLUMN`，故列定义变更与索引/约束变更都走「建新表 → 拷贝数据 → 删旧表 → 重命名」流程，在单个事务内完成、失败自动回滚（详见「SQLite 的迁移场景」）
 - [ ] 迁移回滚 — 本库迁移是声明式的（每次对比当前状态与目标状态），难以自动生成 down：`DROP COLUMN` 后数据已丢失，且 MySQL 的 DDL 不支持在事务中回滚（SQLite 则可以，已实测）。计划先落地「失败时按逆操作尽力回滚」，有损步骤明确报错而非静默继续
 - [x] 更细粒度的后端特性开关（按需启用 MySQL / PostgreSQL / SQLite）

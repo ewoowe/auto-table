@@ -8,7 +8,9 @@
 //! MySQL and SQLite are supported. PostgreSQL is not: its ALTER syntax splits
 //! a column change into several clauses, which needs its own generator.
 
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement, TransactionTrait};
+use sea_orm::{
+    ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbBackend, Statement, TransactionTrait,
+};
 
 use crate::diff::{diff_table, ColumnChange, IndexChange, TableDiff};
 use crate::parse::{parse_create_table, PRIMARY_INDEX_NAME};
@@ -73,6 +75,70 @@ impl MigrationPlan {
     }
 }
 
+/// How to behave when several instances might migrate at the same time
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LockBehavior {
+    /// Run without a lock
+    ///
+    /// Two instances migrating at once will run the same statements and the
+    /// second one fails on statements the first already applied. Use the other
+    /// variants when the application is deployed more than once.
+    #[default]
+    None,
+    /// Take the lock, and fail if it cannot be had
+    Required,
+    /// Take the lock, and skip the migration entirely if someone else has it
+    ///
+    /// The other instance is already applying the same changes, so skipping is
+    /// safe.
+    SkipIfLocked,
+}
+
+/// Options for [`apply_migrations_with`]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MigrateOptions {
+    /// What to do when another instance may be migrating
+    pub lock: LockBehavior,
+    /// Seconds to wait for the lock; 0 returns immediately
+    pub lock_timeout_secs: u32,
+}
+
+impl Default for MigrateOptions {
+    fn default() -> Self {
+        Self {
+            lock: LockBehavior::None,
+            lock_timeout_secs: 0,
+        }
+    }
+}
+
+impl MigrateOptions {
+    /// Migrate only after taking the lock, waiting up to `timeout_secs` for it
+    pub fn locked(timeout_secs: u32) -> Self {
+        Self {
+            lock: LockBehavior::Required,
+            lock_timeout_secs: timeout_secs,
+        }
+    }
+
+    /// Migrate if the lock is free, otherwise leave it to the running instance
+    pub fn skip_if_locked(timeout_secs: u32) -> Self {
+        Self {
+            lock: LockBehavior::SkipIfLocked,
+            lock_timeout_secs: timeout_secs,
+        }
+    }
+}
+
+/// What [`apply_migrations_with`] ended up doing
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationOutcome {
+    /// The plan was applied
+    Applied,
+    /// Another instance holds the lock, so nothing was run
+    Skipped,
+}
+
 /// Compares every registered table against the database and builds a plan
 ///
 /// Tables that do not exist yet are skipped: creating them is the job of
@@ -119,17 +185,36 @@ pub async fn apply_migrations(
     db: &DatabaseConnection,
     plan: &MigrationPlan,
 ) -> Result<(), TableError> {
-    for migration in &plan.tables {
-        if migration.transactional {
-            apply_in_transaction(db, &migration.statements).await?;
-        } else {
-            for sql in &migration.statements {
-                execute(db, sql).await?;
-            }
-        }
+    apply_migrations_with(db, plan, MigrateOptions::default()).await?;
+    Ok(())
+}
+
+/// Executes a plan, optionally holding a lock while doing so
+///
+/// Without a lock, two instances starting together apply the same statements
+/// and the slower one fails on statements the faster one already ran. With a
+/// lock, only the instance holding it migrates.
+pub async fn apply_migrations_with(
+    db: &DatabaseConnection,
+    plan: &MigrationPlan,
+    options: MigrateOptions,
+) -> Result<MigrationOutcome, TableError> {
+    if plan.is_empty() {
+        return Ok(MigrationOutcome::Applied);
     }
 
-    Ok(())
+    if options.lock == LockBehavior::None {
+        for migration in &plan.tables {
+            if migration.transactional {
+                apply_in_transaction(db, &migration.statements).await?;
+            } else {
+                run_statements(db, &migration.statements).await?;
+            }
+        }
+        return Ok(MigrationOutcome::Applied);
+    }
+
+    apply_under_lock(db, options).await
 }
 
 /// Turns the diff of one table into the statements that apply it
@@ -182,6 +267,191 @@ async fn execute<C: ConnectionTrait>(conn: &C, sql: &str) -> Result<(), TableErr
             source,
         })?;
     Ok(())
+}
+
+/// Runs a group of statements in order
+async fn run_statements<C: ConnectionTrait>(
+    conn: &C,
+    statements: &[String],
+) -> Result<(), TableError> {
+    for sql in statements {
+        execute(conn, sql).await?;
+    }
+    Ok(())
+}
+
+/// Applies a whole plan while holding a lock, so only one instance migrates
+///
+/// Everything runs on a single transaction. That is not incidental:
+///
+/// - MySQL's `GET_LOCK` is a *session* lock, so it only guards statements sent
+///   over the same connection. Running the migration inside a transaction pins
+///   it to one connection, which is what makes the lock effective. (DDL commits
+///   the transaction implicitly, but that does not release the lock — verified
+///   against MySQL 8.)
+/// - SQLite has no named locks, but its own write lock already serialises
+///   writers; the transaction is what the table rebuild needs anyway.
+async fn apply_under_lock(
+    db: &DatabaseConnection,
+    options: MigrateOptions,
+) -> Result<MigrationOutcome, TableError> {
+    let backend = db.get_database_backend();
+    let is_sqlite = backend == DbBackend::Sqlite;
+
+    if is_sqlite {
+        execute(db, "PRAGMA foreign_keys = OFF").await?;
+    }
+
+    let transaction = db
+        .begin()
+        .await
+        .map_err(|source| TableError::MigrationFailed {
+            sql: "BEGIN".to_string(),
+            source,
+        })?;
+
+    let acquired = match backend {
+        DbBackend::MySql => acquire_mysql_lock(&transaction, options.lock_timeout_secs).await,
+        DbBackend::Sqlite => acquire_sqlite_lock(&transaction, options.lock_timeout_secs).await,
+        other => Err(TableError::UnsupportedBackend(other)),
+    };
+
+    // A `false` or an error returns early, so getting past this match means the
+    // lock is held.
+    match acquired {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = transaction.rollback().await;
+            if is_sqlite {
+                execute(db, "PRAGMA foreign_keys = ON").await?;
+            }
+            return match options.lock {
+                LockBehavior::Required => Err(TableError::MigrationLockNotAcquired {
+                    timeout_secs: options.lock_timeout_secs,
+                }),
+                _ => Ok(MigrationOutcome::Skipped),
+            };
+        }
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            if is_sqlite {
+                execute(db, "PRAGMA foreign_keys = ON").await?;
+            }
+            return Err(error);
+        }
+    };
+
+    // Plan again now that the lock is ours: while we were waiting, another
+    // instance may well have applied the very same changes, and replaying a
+    // stale plan would only fail on statements already applied.
+    let plan = plan_migrations(db).await?;
+
+    // Already inside a transaction, so statements run as they are: a nested
+    // transaction would not work on either backend.
+    let mut failure = None;
+    for migration in &plan.tables {
+        if let Err(error) = run_statements(&transaction, &migration.statements).await {
+            failure = Some(error);
+            break;
+        }
+    }
+
+    let outcome = match failure {
+        Some(error) => {
+            release_lock(&transaction, backend).await?;
+            let _ = transaction.rollback().await;
+            Err(error)
+        }
+        None => {
+            release_lock(&transaction, backend).await?;
+            transaction
+                .commit()
+                .await
+                .map_err(|source| TableError::MigrationFailed {
+                    sql: "COMMIT".to_string(),
+                    source,
+                })?;
+            Ok(MigrationOutcome::Applied)
+        }
+    };
+
+    if is_sqlite {
+        execute(db, "PRAGMA foreign_keys = ON").await?;
+    }
+
+    outcome
+}
+
+/// Prefix of the MySQL lock name
+///
+/// The database name is appended, so two applications sharing a MySQL instance
+/// do not block each other.
+const LOCK_NAME_PREFIX: &str = "auto-table-migration";
+
+/// Takes MySQL's named lock, returning whether it was obtained
+///
+/// Must be called on the same connection that runs the migration, which the
+/// surrounding transaction guarantees.
+async fn acquire_mysql_lock(
+    transaction: &DatabaseTransaction,
+    timeout_secs: u32,
+) -> Result<bool, TableError> {
+    let sql = format!(
+        "SELECT GET_LOCK(CONCAT('{LOCK_NAME_PREFIX}-', DATABASE()), {timeout_secs})"
+    );
+
+    let row = transaction
+        .query_one_raw(Statement::from_string(DbBackend::MySql, sql))
+        .await
+        .map_err(|source| TableError::MigrationFailed {
+            sql: "GET_LOCK".to_string(),
+            source,
+        })?;
+
+    // 1 = obtained, 0 = timed out, NULL = an error occurred
+    let obtained = row
+        .and_then(|row| row.try_get_by_index::<i32>(0).ok())
+        .unwrap_or(0);
+
+    Ok(obtained == 1)
+}
+
+async fn release_mysql_lock(transaction: &DatabaseTransaction) -> Result<(), TableError> {
+    let sql = format!("SELECT RELEASE_LOCK(CONCAT('{LOCK_NAME_PREFIX}-', DATABASE()))");
+
+    transaction
+        .execute_raw(Statement::from_string(DbBackend::MySql, sql))
+        .await
+        .map_err(|source| TableError::MigrationFailed {
+            sql: "RELEASE_LOCK".to_string(),
+            source,
+        })?;
+
+    Ok(())
+}
+
+/// SQLite has no named locks; its write lock already serialises writers
+///
+/// All this does is make a concurrent writer wait for its turn instead of
+/// failing immediately with SQLITE_BUSY.
+async fn acquire_sqlite_lock(
+    transaction: &DatabaseTransaction,
+    timeout_secs: u32,
+) -> Result<bool, TableError> {
+    let millis = u64::from(timeout_secs) * 1000;
+    execute(transaction, &format!("PRAGMA busy_timeout = {millis}")).await?;
+    Ok(true)
+}
+
+async fn release_lock(
+    transaction: &DatabaseTransaction,
+    backend: DbBackend,
+) -> Result<(), TableError> {
+    match backend {
+        DbBackend::MySql => release_mysql_lock(transaction).await,
+        // SQLite releases its write lock when the transaction ends
+        _ => Ok(()),
+    }
 }
 
 /// Runs a group of statements as one unit

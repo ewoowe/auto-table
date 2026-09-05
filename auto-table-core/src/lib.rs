@@ -30,7 +30,8 @@ pub use diff::{
     diff_table, ColumnAspect, ColumnChange, IndexChange, TableDiff,
 };
 pub use migrate::{
-    apply_migrations, plan_migrations, plan_table_migration, plan_table_statements, MigrationPlan,
+    apply_migrations, apply_migrations_with, plan_migrations, plan_table_migration,
+    plan_table_statements, LockBehavior, MigrateOptions, MigrationOutcome, MigrationPlan,
     TableMigration,
 };
 pub use parse::{parse_create_table, ParseError, PRIMARY_INDEX_NAME};
@@ -90,6 +91,12 @@ pub enum TableError {
     MissingCreateStatement {
         /// The table that would have been rebuilt
         table: String,
+    },
+    /// Another instance is migrating and the lock could not be taken
+    #[error("could not take the migration lock within {timeout_secs}s, another instance is migrating")]
+    MigrationLockNotAcquired {
+        /// How long we waited before giving up
+        timeout_secs: u32,
     },
 }
 

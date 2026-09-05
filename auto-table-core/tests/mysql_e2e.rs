@@ -19,9 +19,12 @@
 use std::sync::OnceLock;
 
 use auto_table_core::{
-    apply_migrations, create_missing_tables, plan_migrations, MigrationPlan,
+    apply_migrations, apply_migrations_with, create_missing_tables, plan_migrations,
+    MigrateOptions, MigrationOutcome, MigrationPlan, TableError,
 };
-use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
+use sea_orm::{
+    ConnectionTrait, Database, DatabaseConnection, DbBackend, TransactionTrait,
+};
 use tokio::sync::Mutex;
 
 /// Connection string used when `AUTO_TABLE_TEST_DATABASE_URL` is not set
@@ -478,6 +481,140 @@ async fn apply_migrations_brings_every_registered_table_in_sync() {
     assert!(
         statements_for(&plan, "e2e_add_column").is_empty(),
         "`e2e_add_column` should be in sync after applying"
+    );
+}
+
+/// The lock name the library uses, so the test can take it the same way
+const LOCK_SQL: &str = "CONCAT('auto-table-migration-', DATABASE())";
+
+/// Simulates another instance holding the lock while this one tries to migrate
+#[tokio::test]
+async fn a_second_instance_waits_while_the_lock_is_held() {
+    let _guard = serial().await;
+    let db = connect().await;
+
+    // Put one table behind so there is something to migrate
+    create_legacy_table(
+        &db,
+        "e2e_add_column",
+        "`id` int NOT NULL PRIMARY KEY AUTO_INCREMENT, `email` varchar(255) NOT NULL",
+    )
+    .await;
+    let plan = plan_migrations(&db).await.expect("plan the migration");
+    assert!(
+        !statements_for(&plan, "e2e_add_column").is_empty(),
+        "there should be something to migrate"
+    );
+
+    // Another instance takes the lock and holds it
+    let holder = db.begin().await.expect("begin the holder transaction");
+    holder
+        .execute_raw(sea_orm::Statement::from_string(
+            DbBackend::MySql,
+            format!("SELECT GET_LOCK({LOCK_SQL}, 0)"),
+        ))
+        .await
+        .expect("the holder takes the lock");
+
+    // Skipping is a valid answer: the other instance is applying the same plan
+    let outcome = apply_migrations_with(&db, &plan, MigrateOptions::skip_if_locked(0))
+        .await
+        .expect("skipping is not an error");
+    assert_eq!(
+        outcome,
+        MigrationOutcome::Skipped,
+        "a locked database must be skipped rather than migrated"
+    );
+
+    // Insisting on the lock reports it instead
+    let error = apply_migrations_with(&db, &plan, MigrateOptions::locked(0))
+        .await
+        .expect_err("a locked database must not migrate");
+    assert!(
+        matches!(error, TableError::MigrationLockNotAcquired { .. }),
+        "expected a lock error, got {error:?}"
+    );
+
+    // Once the other instance is done, this one may proceed
+    holder
+        .execute_raw(sea_orm::Statement::from_string(
+            DbBackend::MySql,
+            format!("SELECT RELEASE_LOCK({LOCK_SQL})"),
+        ))
+        .await
+        .expect("the holder releases the lock");
+    holder.rollback().await.expect("end the holder transaction");
+
+    let outcome = apply_migrations_with(&db, &plan, MigrateOptions::locked(0))
+        .await
+        .expect("migrate once the lock is free");
+    assert_eq!(outcome, MigrationOutcome::Applied);
+
+    let plan = plan_migrations(&db).await.expect("plan again");
+    assert!(
+        statements_for(&plan, "e2e_add_column").is_empty(),
+        "the migration must have been applied"
+    );
+}
+
+/// A plan built before someone else migrated must not be replayed
+#[tokio::test]
+async fn a_stale_plan_is_not_replayed_when_the_lock_is_taken() {
+    let _guard = serial().await;
+    let db = connect().await;
+
+    create_legacy_table(
+        &db,
+        "e2e_add_column",
+        "`id` int NOT NULL PRIMARY KEY AUTO_INCREMENT, `email` varchar(255) NOT NULL",
+    )
+    .await;
+    let stale = plan_migrations(&db).await.expect("plan the migration");
+    let stale_statements: Vec<String> = statements_for(&stale, "e2e_add_column")
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    assert!(!stale_statements.is_empty(), "there should be a plan to reuse");
+
+    // Another instance takes the lock, migrates and releases it
+    let other = db.begin().await.expect("begin the other transaction");
+    other
+        .execute_raw(sea_orm::Statement::from_string(
+            DbBackend::MySql,
+            format!("SELECT GET_LOCK({LOCK_SQL}, 0)"),
+        ))
+        .await
+        .expect("the other instance takes the lock");
+    for sql in &stale_statements {
+        other
+            .execute_raw(sea_orm::Statement::from_string(
+                DbBackend::MySql,
+                sql.clone(),
+            ))
+            .await
+            .expect("the other instance migrates");
+    }
+    other
+        .execute_raw(sea_orm::Statement::from_string(
+            DbBackend::MySql,
+            format!("SELECT RELEASE_LOCK({LOCK_SQL})"),
+        ))
+        .await
+        .expect("the other instance releases the lock");
+    other.commit().await.expect("the other instance commits");
+
+    // This instance still holds the now outdated plan. Replaying it would fail
+    // on the column the other instance already added, so the plan is rebuilt
+    // after the lock is taken.
+    let outcome = apply_migrations_with(&db, &stale, MigrateOptions::locked(0))
+        .await
+        .expect("a stale plan must not be replayed");
+    assert_eq!(outcome, MigrationOutcome::Applied);
+
+    let plan = plan_migrations(&db).await.expect("plan again");
+    assert!(
+        statements_for(&plan, "e2e_add_column").is_empty(),
+        "nothing should be left to migrate"
     );
 }
 
