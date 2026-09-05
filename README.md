@@ -327,6 +327,42 @@ The core library exposes a precise [`auto_table_core::TableError`](auto-table-co
 - [ ] Rollback (down migration) support — migrations here are declarative (diff the current state against the target state), so a `down` cannot be generated reliably: data is already gone after `DROP COLUMN`, and MySQL DDL does not roll back inside a transaction (SQLite does, verified). Plan: first ship "best-effort rollback via reverse operations on failure", and make lossy steps fail loudly instead of silently continuing
 - [x] Finer-grained backend feature flags (opt-in MySQL / PostgreSQL / SQLite)
 
+## Test coverage
+
+The library is verified by two layers that together exercise every migration scenario on all three backends:
+
+- **Unit tests** live next to the planner in `auto-table-core/src/backend/{mysql,postgres,sqlite}.rs`. They assert the exact DDL each `IndexChange` / `ColumnAspect` produces, plus type normalization and statement ordering — no database required. (72 tests.)
+- **End-to-end tests** in `auto-table-core/tests/{mysql,pg,sqlite}_e2e.rs` drive the whole path — read the live schema → diff against the entity → plan → apply real DDL → assert the plan is empty on the next run. They run against a live MySQL 8, PostgreSQL 18 and the bundled SQLite. (19 + 15 + 11 = 45 tests.)
+
+`cargo test -p auto-table-core --all-features` with `AUTO_TABLE_TEST_DATABASE_URL` / `AUTO_TABLE_TEST_POSTGRES_URL` set runs all **117 tests**; the suite currently passes with **zero warnings**.
+
+### Scenario matrix
+
+| Migration scenario | MySQL | PostgreSQL | SQLite | Caveats |
+| --- | --- | --- | --- | --- |
+| Create missing tables / already in sync | ✅ baseline | ✅ baseline | ✅ baseline | `create_missing_tables`, then an empty plan once in sync |
+| Add a column | ✅ `adds_a_column_missing_from_the_table` | ✅ `adds_a_column_missing_from_the_table` | ✅ `adds_a_column_without_rebuilding` | SQLite adds without a rebuild (additive) |
+| Drop a column | ✅ `drops_a_column_…` | ✅ `drops_a_column_…` | ✅ `drops_a_column_without_rebuilding` | destructive — irreversible |
+| Widen a type (`int` → `bigint`) | ✅ `widens_a_column_type` | ✅ `widens_a_column_type` | ✅ `widening_i32_to_i64_is_not_a_change` | SQLite: same affinity → no statements at all |
+| Tighten to `NOT NULL` | ✅ `makes_a_nullable_column_required` | ✅ `makes_a_required_column_nullable` | ✅ (rebuild) | SQLite rebuilds the table |
+| Relax to nullable | ◐ unit | ✅ `makes_a_required_column_nullable` | ✅ (rebuild) | MySQL repeats the whole column definition |
+| Change a default value | ✅ `adds_a_default_value` | ✅ `adds_a_default_value` | ✅ `adds_a_default_value_by_rebuilding` / `changes_a_default_value_by_rebuilding` | SQLite rebuilds the table |
+| Add `NOT NULL` column with a default | ✅ `adds_a_not_null_column_with_a_default` | ◐ unit | ✅ `adds_a_not_null_column_with_a_default` | — |
+| Add `NOT NULL` column without a default | ✅ `adds_a_required_column_without_a_default` | ◐ unit | ⚠️ errors (documented) | MySQL strict mode *silently* fills `''`/`0`; SQLite refuses the statement |
+| Add a unique index / constraint | ✅ `adds_a_missing_unique_index` | ✅ `adds_a_missing_unique_constraint` | ✅ `adds_a_missing_unique_index_by_rebuilding` | SQLite rebuilds the table |
+| Drop a unique index / constraint | ✅ `drops_an_index_…` | ✅ `drops_a_unique_constraint` | ✅ (rebuild) | — |
+| Add a **plain (non-unique)** index | ⚠️ not covered | ⚠️ not covered | ⚠️ not covered | `parse_create_table` ignores table-level `INDEX` clauses, so the expected schema can never hold one; only the **drop** direction is reachable |
+| Drop a plain index | ✅ `drops_a_plain_index` | ✅ `drops_a_plain_index` | ✅ `drops_an_index_by_rebuilding` | PG index must be created with a separate `CREATE INDEX`, not inline in `CREATE TABLE` |
+| Add `AUTO_INCREMENT` / identity | ✅ `adds_auto_increment_to_a_primary_key` | ✅ `adds_an_identity_to_a_primary_key` | — | SQLite `INTEGER PRIMARY KEY` is already auto-increment |
+| Drop a default value | ◐ unit | ✅ `drops_a_default_value` | ✅ (rebuild) | — |
+| Table rebuild keeps existing rows | — | — | ✅ `rebuilding_keeps_the_rows` | SQLite-only rebuild path |
+| Concurrency lock (run once) | ✅ `a_second_instance_waits…`, `migrate_*` | ✅ `a_second_instance_skips…` | ◐ unit | MySQL `GET_LOCK`; PG `skip_if_locked`; SQLite `busy_timeout` |
+| Idempotency (empty re-plan after apply) | ✅ `a_fully_migrated_database_plans_nothing` | ✅ same | ✅ same | declarative migrations always converge |
+
+Legend: ✅ covered by an e2e test (passes) · ◐ covered at the planner level by unit tests only · ⚠️ known gap or documented error · — not applicable.
+
+The one structural gap worth flagging: because `parse_create_table` does not capture plain (non-unique) table-level indexes, an index declared via SeaORM's `#[sea_orm(indexed)]` is invisible to the expected schema, so it can never be *added* by a migration — only detected and *dropped* when it already exists on the table. This is a limitation of the schema parser, not the DDL planner (which can still emit `ADD INDEX` for it when the diff is built by hand).
+
 ## License
 
 MIT

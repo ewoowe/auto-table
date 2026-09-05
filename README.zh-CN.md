@@ -270,6 +270,42 @@ apply_migrations(&db, &plan).allow_destructive().await?;
 - [ ] 迁移回滚 — 本库迁移是声明式的（每次对比当前状态与目标状态），难以自动生成 down：`DROP COLUMN` 后数据已丢失，且 MySQL 的 DDL 不支持在事务中回滚（SQLite 则可以，已实测）。计划先落地「失败时按逆操作尽力回滚」，有损步骤明确报错而非静默继续
 - [x] 更细粒度的后端特性开关（按需启用 MySQL / PostgreSQL / SQLite）
 
+## 测试覆盖
+
+本库的测试分两层，覆盖三个后端上的每一种迁移场景：
+
+- **单元测试** 紧挨计划器放在 `auto-table-core/src/backend/{mysql,postgres,sqlite}.rs`。它们逐一断言每个 `IndexChange` / `ColumnAspect` 生成的确切 DDL，以及类型归一与语句排序——无需数据库。（72 个测试）
+- **端到端测试** 在 `auto-table-core/tests/{mysql,pg,sqlite}_e2e.rs`，跑通完整链路——读取线上结构 → 与实体做 diff → 生成计划 → 执行真实 DDL → 再计划一次应得到空计划。它们分别对接真实的 MySQL 8、PostgreSQL 18 与内置 SQLite。（19 + 15 + 11 = 45 个测试）
+
+设置好 `AUTO_TABLE_TEST_DATABASE_URL` / `AUTO_TABLE_TEST_POSTGRES_URL` 后执行 `cargo test -p auto-table-core --all-features`，可运行全部 **117 个测试**，目前**全部通过、零告警**。
+
+### 场景矩阵
+
+| 迁移场景 | MySQL | PostgreSQL | SQLite | 注意事项 |
+| --- | --- | --- | --- | --- |
+| 创建缺失表 / 已一致 | ✅ 基线 | ✅ 基线 | ✅ 基线 | 先 `create_missing_tables`，一致后计划为空 |
+| 新增列 | ✅ `adds_a_column_missing_from_the_table` | ✅ `adds_a_column_missing_from_the_table` | ✅ `adds_a_column_without_rebuilding` | SQLite 直接 ADD，不走重建 |
+| 删除列 | ✅ `drops_a_column_…` | ✅ `drops_a_column_…` | ✅ `drops_a_column_without_rebuilding` | 破坏性——不可逆 |
+| 加宽类型（`int` → `bigint`） | ✅ `widens_a_column_type` | ✅ `widens_a_column_type` | ✅ `widening_i32_to_i64_is_not_a_change` | SQLite 同亲和族 → 完全不产生语句 |
+| 收紧为 `NOT NULL` | ✅ `makes_a_nullable_column_required` | ✅ `makes_a_required_column_nullable` | ✅（重建表） | SQLite 走重建 |
+| 放宽为可空 | ◐ 单元 | ✅ `makes_a_required_column_nullable` | ✅（重建表） | MySQL 重复整列定义 |
+| 修改默认值 | ✅ `adds_a_default_value` | ✅ `adds_a_default_value` | ✅ `adds_a_default_value_by_rebuilding` / `changes_a_default_value_by_rebuilding` | SQLite 走重建 |
+| 新增 `NOT NULL` 列（有默认值） | ✅ `adds_a_not_null_column_with_a_default` | ◐ 单元 | ✅ `adds_a_not_null_column_with_a_default` | — |
+| 新增 `NOT NULL` 列（无默认值） | ✅ `adds_a_required_column_without_a_default` | ◐ 单元 | ⚠️ 报错（已记录） | MySQL 严格模式**静默**填 `''`/`0`；SQLite 直接拒绝 |
+| 新增唯一索引 / 约束 | ✅ `adds_a_missing_unique_index` | ✅ `adds_a_missing_unique_constraint` | ✅ `adds_a_missing_unique_index_by_rebuilding` | SQLite 走重建 |
+| 删除唯一索引 / 约束 | ✅ `drops_an_index_…` | ✅ `drops_a_unique_constraint` | ✅（重建表） | — |
+| 新增**普通（非唯一）索引** | ⚠️ 未覆盖 | ⚠️ 未覆盖 | ⚠️ 未覆盖 | `parse_create_table` 忽略表级 `INDEX` 子句，预期 schema 永远装不进它；只有**删除**方向可达 |
+| 删除普通索引 | ✅ `drops_a_plain_index` | ✅ `drops_a_plain_index` | ✅ `drops_an_index_by_rebuilding` | PG 索引须用单独的 `CREATE INDEX` 建，不能写在 `CREATE TABLE` 内 |
+| 新增 `AUTO_INCREMENT` / identity | ✅ `adds_auto_increment_to_a_primary_key` | ✅ `adds_an_identity_to_a_primary_key` | — | SQLite `INTEGER PRIMARY KEY` 本就自增 |
+| 删除默认值 | ◐ 单元 | ✅ `drops_a_default_value` | ✅（重建表） | — |
+| 重建表保留已有数据 | — | — | ✅ `rebuilding_keeps_the_rows` | 仅 SQLite 重建路径 |
+| 并发锁（只跑一次） | ✅ `a_second_instance_waits…`、`migrate_*` | ✅ `a_second_instance_skips…` | ◐ 单元 | MySQL `GET_LOCK`；PG `skip_if_locked`；SQLite `busy_timeout` |
+| 幂等（应用后再计划为空） | ✅ `a_fully_migrated_database_plans_nothing` | ✅ 同上 | ✅ 同上 | 声明式迁移总能收敛 |
+
+图例：✅ 有端到端测试覆盖（通过）· ◐ 仅由单元测试在计划器层覆盖 · ⚠️ 已知缺口或已记录的报错 · — 不适用。
+
+需要特别指出的一处结构性缺口：由于 `parse_create_table` 不读取表级 `INDEX` 子句，经 SeaORM `#[sea_orm(indexed)]` 声明的普通（非唯一）索引对预期 schema 不可见，因此迁移**永远无法"新增"它**——只有当它已存在于表中时才会被识别并**删除**。这是 schema 解析器的限制，而非 DDL 计划器的限制（后者在手动构造 diff 时仍能正确输出 `ADD INDEX`）。
+
 ## License
 
 MIT
