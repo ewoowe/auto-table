@@ -136,11 +136,14 @@ Two notes on how it works:
   migration runs inside one transaction to pin it to a connection — otherwise
   the lock would guard nothing. The lock name includes the database, so two
   databases on one server do not block each other.
+- **PostgreSQL** uses `pg_advisory_lock` on a fixed key. It is session-scoped
+  like `GET_LOCK`, so the migration runs inside one transaction to keep the lock
+  effective; `pg_try_advisory_lock` backs the non-blocking `skip` mode.
 - **SQLite** has no named locks and relies on its own write lock; taking the
   lock only adds a `busy_timeout` so a concurrent instance queues instead of
   failing immediately with `SQLITE_BUSY`.
 
-On both backends the plan is **rebuilt after the lock is taken**: while waiting
+On all three backends the plan is **rebuilt after the lock is taken**: while waiting
 for the lock, another instance may well have finished migrating, and replaying a
 stale plan would only fail.
 
@@ -262,16 +265,16 @@ proposed classification, with the MySQL and SQLite columns measured:
 
 | Change | Risk | MySQL | SQLite | PostgreSQL |
 | --- | --- | --- | --- | --- |
-| Add a nullable column | Safe | filled with `NULL` | filled with `NULL` | to be measured |
-| Add a `NOT NULL` column with a default | Safe | filled with the default | filled with the default | to be measured |
-| Widen a type (`int` -> `bigint`) | Safe | lossless | no statements, same affinity | to be measured |
-| Change a default value | Safe | existing rows untouched | rebuilt, existing rows keep their values | to be measured |
-| Drop an index | Safe | data untouched | rebuilt, data untouched | to be measured |
-| Add a `NOT NULL` column without a default | Caution | **silently filled with `''` or `0`** | errors out | to be measured |
-| Narrow a type | Caution | errors in strict mode | converted to the new affinity; values that do not convert are kept | to be measured |
-| Tighten to `NOT NULL` | Caution | errors while `NULL`s exist | rebuild fails and rolls back, table intact | to be measured |
-| Add a unique index or constraint | Caution | errors while duplicates exist | rebuild fails and rolls back, table intact | to be measured |
-| **Drop a column** | **Destructive** | **data lost for good, no rollback** | **data lost for good, no rollback** | to be measured |
+| Add a nullable column | Safe | filled with `NULL` | filled with `NULL` | filled with `NULL` |
+| Add a `NOT NULL` column with a default | Safe | filled with the default | filled with the default | filled with the default |
+| Widen a type (`int` -> `bigint`) | Safe | lossless | no statements, same affinity | lossless |
+| Change a default value | Safe | existing rows untouched | rebuilt, existing rows keep their values | existing rows untouched |
+| Drop an index | Safe | data untouched | rebuilt, data untouched | data untouched |
+| Add a `NOT NULL` column without a default | Caution | **silently filled with `''` or `0`** | errors out | **errors out if rows exist** |
+| Narrow a type | Caution | errors in strict mode | converted to the new affinity; values that do not convert are kept | errors when a value does not fit |
+| Tighten to `NOT NULL` | Caution | errors while `NULL`s exist | rebuild fails and rolls back, table intact | errors while `NULL`s exist |
+| Add a unique index or constraint | Caution | errors while duplicates exist | rebuild fails and rolls back, table intact | errors while duplicates exist |
+| **Drop a column** | **Destructive** | **data lost for good, no rollback** | **data lost for good, no rollback** | **data lost for good** |
 
 Proposed API (not implemented, still subject to change):
 
@@ -298,11 +301,10 @@ Two deliberate trade-offs:
   field change would prompt, and people would click through prompts by habit,
   which defeats the protection entirely.
 
-> The PostgreSQL column is a placeholder: the backend has no migration support
-> yet, and its ALTER syntax differs enough that the behaviour needs measuring.
-> Note that the same change can differ in how dangerous it is — most visibly
-> "add a `NOT NULL` column without a default", which MySQL fills silently while
-> SQLite refuses outright.
+> PostgreSQL is now fully supported and measured. One notable divergence: "add a
+> `NOT NULL` column without a default" **errors out** in both PostgreSQL and
+> SQLite (unless the table is empty), whereas MySQL silently fills existing rows
+> with `''` or `0`.
 
 > This section is a design draft and is not implemented yet.
 
@@ -320,9 +322,8 @@ The core library exposes a precise [`auto_table_core::TableError`](auto-table-co
 
 ## Roadmap
 
-- [ ] **Database migrations** — available on MySQL already (see "4. Migrating tables that already exist"), still to be completed:
-  - Risk classification: irreversible changes such as dropping a column require explicit approval, otherwise the entire plan is refused (see the design draft above)
-  - Concurrency safety: a database lock keeps all but one instance from migrating at once (done for MySQL with `GET_LOCK` and for SQLite with its write lock plus a `busy_timeout`; see "5. Concurrency"). PostgreSQL's `pg_advisory_lock` arrives with migration support for that backend
+- [x] **Database migrations** — available on MySQL, SQLite and PostgreSQL (see "4. Migrating tables that already exist" and "PostgreSQL migration scenarios"). The concurrency lock uses each backend's native mechanism — MySQL `GET_LOCK`, SQLite its write lock plus a `busy_timeout`, PostgreSQL `pg_advisory_lock` (see "5. Concurrency") — and the plan is re-planned after the lock is taken so a stale plan is never replayed.
+  - Risk classification (see the design draft in "Risk classification") is not yet enforced: dropping a column is still destructive and is only protected once the proposed approval API lands.
 - [x] **SQLite migrations (including table rebuild)** — SQLite has no `MODIFY COLUMN`, so changes to a column definition and to indexes or constraints go through "create new table → copy data → drop old → rename", inside a single transaction that rolls back on failure (see "SQLite migration scenarios")
 - [ ] Rollback (down migration) support — migrations here are declarative (diff the current state against the target state), so a `down` cannot be generated reliably: data is already gone after `DROP COLUMN`, and MySQL DDL does not roll back inside a transaction (SQLite does, verified). Plan: first ship "best-effort rollback via reverse operations on failure", and make lossy steps fail loudly instead of silently continuing
 - [x] Finer-grained backend feature flags (opt-in MySQL / PostgreSQL / SQLite)
