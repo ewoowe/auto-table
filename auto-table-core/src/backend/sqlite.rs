@@ -710,4 +710,142 @@ mod tests {
             sqlite_type_affinity("varchar(255)")
         );
     }
+
+
+    #[test]
+    fn sqlite_rebuilds_when_a_plain_index_is_added() {
+        // Any index change rebuilds the table on SQLite, and the new index is
+        // recreated against the original table name afterwards.
+        let create_sql = "CREATE TABLE \"users\" ( \"id\" integer NOT NULL PRIMARY KEY AUTOINCREMENT, \"email\" varchar NOT NULL )";
+        let migration = plan_table_migration(
+            &diff(
+                vec![],
+                vec![IndexChange::Add(IndexSchema {
+                    name: "email".to_string(),
+                    columns: vec!["email".to_string()],
+                    unique: false,
+                    primary: false,
+                })],
+            ),
+            DbBackend::Sqlite,
+            create_sql,
+        )
+        .expect("sqlite plan");
+
+        assert!(migration.transactional);
+        assert!(migration
+            .statements
+            .last()
+            .map(|sql| sql.contains("CREATE INDEX \"email\" ON \"users\" (\"email\")"))
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn sqlite_rebuilds_when_a_plain_index_is_dropped() {
+        // Dropping an index also rebuilds; the index simply is not recreated.
+        let create_sql = "CREATE TABLE \"users\" ( \"id\" integer NOT NULL PRIMARY KEY AUTOINCREMENT, \"email\" varchar NOT NULL )";
+        let migration = plan_table_migration(
+            &diff(
+                vec![],
+                vec![IndexChange::Drop(IndexSchema {
+                    name: "email".to_string(),
+                    columns: vec!["email".to_string()],
+                    unique: false,
+                    primary: false,
+                })],
+            ),
+            DbBackend::Sqlite,
+            create_sql,
+        )
+        .expect("sqlite plan");
+
+        assert!(migration.transactional);
+        assert!(!migration
+            .statements
+            .iter()
+            .any(|sql| sql.contains("CREATE INDEX")));
+    }
+
+
+    #[test]
+    fn sqlite_adds_a_not_null_column_with_a_default() {
+        assert_eq!(
+            sqlite_plan(
+                vec![ColumnChange::Add(ColumnSchema {
+                    name: "age".to_string(),
+                    col_type: "bigint".to_string(),
+                    nullable: false,
+                    default: Some("0".to_string()),
+                    auto_increment: false,
+                })],
+                vec![],
+            ),
+            vec!["ALTER TABLE \"users\" ADD COLUMN \"age\" bigint NOT NULL DEFAULT '0'"]
+        );
+    }
+
+    #[test]
+    fn sqlite_rebuilds_when_only_a_default_changes() {
+        let create_sql = "CREATE TABLE \"users\" ( \"id\" integer NOT NULL PRIMARY KEY AUTOINCREMENT, \"name\" text NOT NULL, \"status\" varchar DEFAULT 'member' )";
+        let migration = plan_table_migration(
+            &diff(
+                vec![ColumnChange::Alter {
+                    name: "status".to_string(),
+                    to: column("status", "varchar"),
+                    aspects: vec![ColumnAspect::Default {
+                        from: Some("'active'".to_string()),
+                        to: Some("'member'".to_string()),
+                    }],
+                }],
+                vec![],
+            ),
+            DbBackend::Sqlite,
+            create_sql,
+        )
+        .expect("sqlite plan");
+
+        assert!(migration.transactional, "a rebuild must be transactional");
+        assert!(migration
+            .statements
+            .iter()
+            .any(|sql| sql.contains(REBUILD_SUFFIX)));
+        assert!(migration
+            .statements
+            .iter()
+            .any(|sql| sql.contains("INSERT INTO \"users__auto_table_rebuild\"")));
+    }
+
+    #[test]
+    fn sqlite_rebuilds_when_a_unique_constraint_is_added() {
+        let create_sql = "CREATE TABLE \"users\" ( \"id\" integer NOT NULL PRIMARY KEY AUTOINCREMENT, \"email\" varchar NOT NULL )";
+        let migration = plan_table_migration(
+            &diff(
+                vec![],
+                vec![IndexChange::Add(IndexSchema {
+                    name: "email".to_string(),
+                    columns: vec!["email".to_string()],
+                    unique: true,
+                    primary: false,
+                })],
+            ),
+            DbBackend::Sqlite,
+            create_sql,
+        )
+        .expect("sqlite plan");
+
+        assert!(migration.transactional);
+        assert!(migration
+            .statements
+            .last()
+            .map(|sql| sql.contains("CREATE UNIQUE INDEX \"email\""))
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn sqlite_type_affinity_groups_length_specifications() {
+        assert_eq!(sqlite_type_affinity("varchar(255)"), "TEXT");
+        assert_eq!(sqlite_type_affinity("decimal(10,2)"), "NUMERIC");
+        assert_eq!(sqlite_type_affinity(""), "BLOB");
+    }
+
 }

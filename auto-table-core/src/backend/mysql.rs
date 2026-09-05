@@ -662,4 +662,163 @@ mod tests {
         assert!(added.contains(&"active"), "active should be added: {diff:?}");
     }
     }
+
+
+    #[test]
+    fn mysql_adds_a_not_null_column_with_a_default() {
+        assert_eq!(
+            mysql_plan(
+                vec![ColumnChange::Add(ColumnSchema {
+                    name: "age".to_string(),
+                    col_type: "bigint".to_string(),
+                    nullable: false,
+                    default: Some("0".to_string()),
+                    auto_increment: false,
+                })],
+                vec![],
+            ),
+            vec!["ALTER TABLE `users` ADD COLUMN `age` bigint NOT NULL DEFAULT '0'"]
+        );
+    }
+
+    #[test]
+    fn mysql_adds_an_auto_increment_column() {
+        assert_eq!(
+            mysql_plan(
+                vec![ColumnChange::Add(ColumnSchema {
+                    name: "id".to_string(),
+                    col_type: "bigint".to_string(),
+                    nullable: false,
+                    default: None,
+                    auto_increment: true,
+                })],
+                vec![],
+            ),
+            vec!["ALTER TABLE `users` ADD COLUMN `id` bigint NOT NULL AUTO_INCREMENT"]
+        );
+    }
+
+    #[test]
+    fn mysql_adds_a_plain_index() {
+        assert_eq!(
+            mysql_plan(
+                vec![],
+                vec![IndexChange::Add(IndexSchema {
+                    name: "email".to_string(),
+                    columns: vec!["email".to_string()],
+                    unique: false,
+                    primary: false,
+                })],
+            ),
+            vec!["ALTER TABLE `users` ADD INDEX `email` (`email`)"]
+        );
+    }
+
+    #[test]
+    fn mysql_adds_a_unique_index() {
+        assert_eq!(
+            mysql_plan(
+                vec![],
+                vec![IndexChange::Add(IndexSchema {
+                    name: "email".to_string(),
+                    columns: vec!["email".to_string()],
+                    unique: true,
+                    primary: false,
+                })],
+            ),
+            vec!["ALTER TABLE `users` ADD UNIQUE INDEX `email` (`email`)"]
+        );
+    }
+
+    #[test]
+    fn mysql_drops_a_plain_index() {
+        assert_eq!(
+            mysql_plan(
+                vec![],
+                vec![IndexChange::Drop(IndexSchema {
+                    name: "email".to_string(),
+                    columns: vec!["email".to_string()],
+                    unique: false,
+                    primary: false,
+                })],
+            ),
+            vec!["ALTER TABLE `users` DROP INDEX `email`"]
+        );
+    }
+
+    #[test]
+    fn mysql_repeats_the_whole_definition_for_a_nullability_change() {
+        let target = ColumnSchema {
+            name: "age".to_string(),
+            col_type: "int".to_string(),
+            nullable: false,
+            default: None,
+            auto_increment: false,
+        };
+        assert_eq!(
+            mysql_plan(
+                vec![ColumnChange::Alter {
+                    name: "age".to_string(),
+                    to: target,
+                    aspects: vec![ColumnAspect::Nullable { from: true, to: false }],
+                }],
+                vec![],
+            ),
+            vec!["ALTER TABLE `users` MODIFY COLUMN `age` int NOT NULL"]
+        );
+    }
+
+    #[test]
+    fn mysql_orders_every_kind_of_change() {
+        assert_eq!(
+            mysql_plan(
+                vec![
+                    ColumnChange::Drop { name: "legacy".to_string() },
+                    ColumnChange::Add(column("email", "varchar(255)")),
+                    ColumnChange::Alter {
+                        name: "age".to_string(),
+                        to: ColumnSchema {
+                            name: "age".to_string(),
+                            col_type: "bigint".to_string(),
+                            nullable: false,
+                            default: None,
+                            auto_increment: false,
+                        },
+                        aspects: vec![ColumnAspect::Type {
+                            from: "int".to_string(),
+                            to: "bigint".to_string(),
+                        }],
+                    },
+                ],
+                vec![
+                    IndexChange::Drop(IndexSchema {
+                        name: "old_idx".to_string(),
+                        columns: vec!["legacy".to_string()],
+                        unique: false,
+                        primary: false,
+                    }),
+                    IndexChange::Add(IndexSchema {
+                        name: "new_idx".to_string(),
+                        columns: vec!["email".to_string(), "status".to_string()],
+                        unique: false,
+                        primary: false,
+                    }),
+                ],
+            ),
+            vec![
+                "ALTER TABLE `users` DROP INDEX `old_idx`",
+                "ALTER TABLE `users` DROP COLUMN `legacy`",
+                "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+                "ALTER TABLE `users` MODIFY COLUMN `age` bigint NOT NULL",
+                "ALTER TABLE `users` ADD INDEX `new_idx` (`email`, `status`)",
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_mysql_type_keeps_a_trailing_unsigned_modifier() {
+        assert_eq!(normalize_mysql_type("int unsigned"), "int unsigned");
+        assert_eq!(normalize_mysql_type("bigint(20) unsigned"), "bigint unsigned");
+    }
+
 }
