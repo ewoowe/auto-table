@@ -5,17 +5,19 @@
 //! executes anything, so it doubles as the dry run: inspect
 //! [`MigrationPlan::statements`] and only then call [`apply_migrations`].
 //!
-//! MySQL and SQLite are supported. PostgreSQL is not: its ALTER syntax splits
-//! a column change into several clauses, which needs its own generator.
+//! Which statements are produced is up to the backend, through the [`Backend`]
+//! trait: everything here — comparing structures, planning, taking the lock and
+//! executing — is the same regardless of the database.
 
 use sea_orm::{
-    ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbBackend, Statement, TransactionTrait,
+    ConnectionTrait, DatabaseConnection, DbBackend, Statement, TransactionTrait,
 };
 
-use crate::diff::{diff_table, ColumnAspect, ColumnChange, IndexChange, TableDiff};
+use crate::diff::{diff_table, TableDiff};
 use crate::parse::parse_create_table;
-use crate::schema::{get_table_schema, sqlite_type_affinity, ColumnSchema, IndexSchema};
-use crate::{get_all_table_statements, get_existing_tables, get_table_name, TableError};
+use crate::backend::AnyBackend;
+use crate::schema::get_table_schema;
+use crate::{get_all_table_statements, get_existing_tables, get_table_name, Backend, TableError};
 
 /// The statements needed to bring one table in sync
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -145,6 +147,7 @@ pub enum MigrationOutcome {
 /// [`crate::create_missing_tables`], not of a migration.
 pub async fn plan_migrations(db: &DatabaseConnection) -> Result<MigrationPlan, TableError> {
     let backend = db.get_database_backend();
+    let backend_impl = AnyBackend::for_backend(backend)?;
     let existing_tables = get_existing_tables(db, backend).await?;
 
     let mut tables = Vec::new();
@@ -157,13 +160,13 @@ pub async fn plan_migrations(db: &DatabaseConnection) -> Result<MigrationPlan, T
         }
 
         let create_sql = backend.build(&statement).sql;
-        let expected = parse_create_table(&create_sql).map_err(|source| {
+        let mut expected = parse_create_table(&create_sql).map_err(|source| {
             TableError::ParseExpectedFailed {
                 table: table_name,
                 source,
             }
         })?;
-        let expected = normalize_expected(expected, backend);
+        backend_impl.normalize_expected(&mut expected);
         let actual = get_table_schema(db, &expected.name).await?;
 
         let diff = diff_table(&expected, &actual);
@@ -171,7 +174,7 @@ pub async fn plan_migrations(db: &DatabaseConnection) -> Result<MigrationPlan, T
             continue;
         }
 
-        tables.push(plan_table_migration(&diff, backend, &create_sql)?);
+        tables.push(backend_impl.plan(&diff, &create_sql)?);
     }
 
     Ok(MigrationPlan { tables })
@@ -263,32 +266,14 @@ pub fn plan_table_migration(
     backend: DbBackend,
     create_sql: &str,
 ) -> Result<TableMigration, TableError> {
-    match backend {
-        DbBackend::MySql => Ok(TableMigration::new(
-            diff.table.clone(),
-            mysql_statements(diff),
-        )),
-        DbBackend::Sqlite if sqlite_needs_rebuild(diff) => Ok(TableMigration::transactional(
-            diff.table.clone(),
-            sqlite_rebuild(diff, create_sql)?,
-        )),
-        DbBackend::Sqlite => Ok(TableMigration::new(
-            diff.table.clone(),
-            sqlite_simple_alters(diff),
-        )),
-        DbBackend::Postgres => Ok(TableMigration::new(
-            diff.table.clone(),
-            postgres_statements(diff),
-        )),
-        other => Err(TableError::UnsupportedBackend(other)),
-    }
+    AnyBackend::for_backend(backend)?.plan(diff, create_sql)
 }
 
 // ---------------------------------------------------------------------------
 // Shared execution helpers
 // ---------------------------------------------------------------------------
 
-async fn execute<C: ConnectionTrait>(conn: &C, sql: &str) -> Result<(), TableError> {
+pub(crate) async fn execute<C: ConnectionTrait>(conn: &C, sql: &str) -> Result<(), TableError> {
     let backend = conn.get_database_backend();
     conn.execute_raw(Statement::from_string(backend, sql.to_string()))
         .await
@@ -325,12 +310,11 @@ async fn apply_under_lock(
     db: &DatabaseConnection,
     options: MigrateOptions,
 ) -> Result<MigrationOutcome, TableError> {
-    let backend = db.get_database_backend();
-    let is_sqlite = backend == DbBackend::Sqlite;
+    let backend = AnyBackend::for_connection(db)?;
 
-    if is_sqlite {
-        execute(db, "PRAGMA foreign_keys = OFF").await?;
-    }
+    // Some backends have to prepare something outside the transaction: SQLite
+    // turns `PRAGMA foreign_keys` into a no-op inside one.
+    run_outside(db, backend.before_statements()).await?;
 
     let transaction = db
         .begin()
@@ -340,12 +324,9 @@ async fn apply_under_lock(
             source,
         })?;
 
-    let acquired = match backend {
-        DbBackend::MySql => acquire_mysql_lock(&transaction, options.lock_timeout_secs).await,
-        DbBackend::Sqlite => acquire_sqlite_lock(&transaction, options.lock_timeout_secs).await,
-        DbBackend::Postgres => acquire_postgres_lock(&transaction, options.lock_timeout_secs).await,
-        other => Err(TableError::UnsupportedBackend(other)),
-    };
+    let acquired = backend
+        .acquire_lock(&transaction, options.lock_timeout_secs)
+        .await;
 
     // A `false` or an error returns early, so getting past this match means the
     // lock is held.
@@ -353,9 +334,7 @@ async fn apply_under_lock(
         Ok(true) => {}
         Ok(false) => {
             let _ = transaction.rollback().await;
-            if is_sqlite {
-                execute(db, "PRAGMA foreign_keys = ON").await?;
-            }
+            run_outside(db, backend.after_statements()).await?;
             return match options.lock {
                 LockBehavior::Required => Err(TableError::MigrationLockNotAcquired {
                     timeout_secs: options.lock_timeout_secs,
@@ -365,9 +344,7 @@ async fn apply_under_lock(
         }
         Err(error) => {
             let _ = transaction.rollback().await;
-            if is_sqlite {
-                execute(db, "PRAGMA foreign_keys = ON").await?;
-            }
+            run_outside(db, backend.after_statements()).await?;
             return Err(error);
         }
     };
@@ -389,12 +366,12 @@ async fn apply_under_lock(
 
     let outcome = match failure {
         Some(error) => {
-            release_lock(&transaction, backend).await?;
+            backend.release_lock(&transaction).await?;
             let _ = transaction.rollback().await;
             Err(error)
         }
         None => {
-            release_lock(&transaction, backend).await?;
+            backend.release_lock(&transaction).await?;
             transaction
                 .commit()
                 .await
@@ -406,148 +383,17 @@ async fn apply_under_lock(
         }
     };
 
-    if is_sqlite {
-        execute(db, "PRAGMA foreign_keys = ON").await?;
-    }
+    run_outside(db, backend.after_statements()).await?;
 
     outcome
 }
 
-/// Prefix of the MySQL lock name
-///
-/// The database name is appended, so two applications sharing a MySQL instance
-/// do not block each other.
-const LOCK_NAME_PREFIX: &str = "auto-table-migration";
-
-/// Takes MySQL's named lock, returning whether it was obtained
-///
-/// Must be called on the same connection that runs the migration, which the
-/// surrounding transaction guarantees.
-async fn acquire_mysql_lock(
-    transaction: &DatabaseTransaction,
-    timeout_secs: u32,
-) -> Result<bool, TableError> {
-    let sql = format!(
-        "SELECT GET_LOCK(CONCAT('{LOCK_NAME_PREFIX}-', DATABASE()), {timeout_secs})"
-    );
-
-    let row = transaction
-        .query_one_raw(Statement::from_string(DbBackend::MySql, sql))
-        .await
-        .map_err(|source| TableError::MigrationFailed {
-            sql: "GET_LOCK".to_string(),
-            source,
-        })?;
-
-    // 1 = obtained, 0 = timed out, NULL = an error occurred
-    let obtained = row
-        .and_then(|row| row.try_get_by_index::<i32>(0).ok())
-        .unwrap_or(0);
-
-    Ok(obtained == 1)
-}
-
-async fn release_mysql_lock(transaction: &DatabaseTransaction) -> Result<(), TableError> {
-    let sql = format!("SELECT RELEASE_LOCK(CONCAT('{LOCK_NAME_PREFIX}-', DATABASE()))");
-
-    transaction
-        .execute_raw(Statement::from_string(DbBackend::MySql, sql))
-        .await
-        .map_err(|source| TableError::MigrationFailed {
-            sql: "RELEASE_LOCK".to_string(),
-            source,
-        })?;
-
-    Ok(())
-}
-
-/// SQLite has no named locks; its write lock already serialises writers
-///
-/// All this does is make a concurrent writer wait for its turn instead of
-/// failing immediately with SQLITE_BUSY.
-async fn acquire_sqlite_lock(
-    transaction: &DatabaseTransaction,
-    timeout_secs: u32,
-) -> Result<bool, TableError> {
-    let millis = u64::from(timeout_secs) * 1000;
-    execute(transaction, &format!("PRAGMA busy_timeout = {millis}")).await?;
-    Ok(true)
-}
-
-/// Key for PostgreSQL's advisory lock
-///
-/// Advisory locks are scoped to the database, so a fixed key is enough — unlike
-/// MySQL there is nothing to disambiguate between schemas on one server.
-const ADVISORY_LOCK_KEY: i64 = 0x6175_746f_7462_6c65;
-
-/// Takes PostgreSQL's advisory lock
-///
-/// Like MySQL's `GET_LOCK` it is session scoped, so it is taken on the
-/// transaction that runs the migration.
-async fn acquire_postgres_lock(
-    transaction: &DatabaseTransaction,
-    timeout_secs: u32,
-) -> Result<bool, TableError> {
-    if timeout_secs == 0 {
-        // Report straight away whether the lock was free
-        let row = transaction
-            .query_one_raw(Statement::from_string(
-                DbBackend::Postgres,
-                format!("SELECT pg_try_advisory_lock({ADVISORY_LOCK_KEY})"),
-            ))
-            .await
-            .map_err(|source| TableError::MigrationFailed {
-                sql: "pg_try_advisory_lock".to_string(),
-                source,
-            })?;
-
-        return Ok(row
-            .and_then(|row| row.try_get_by_index::<bool>(0).ok())
-            .unwrap_or(false));
+/// Runs statements outside of any transaction
+async fn run_outside(db: &DatabaseConnection, statements: &[&str]) -> Result<(), TableError> {
+    for sql in statements {
+        execute(db, sql).await?;
     }
-
-    // Wait, but not forever. A lock that times out raises an error instead of
-    // returning false, so an error here is reported as "not acquired".
-    execute(
-        transaction,
-        &format!("SET LOCAL lock_timeout = '{timeout_secs}s'"),
-    )
-    .await?;
-
-    let locked = transaction
-        .execute_raw(Statement::from_string(
-            DbBackend::Postgres,
-            format!("SELECT pg_advisory_lock({ADVISORY_LOCK_KEY})"),
-        ))
-        .await;
-
-    Ok(locked.is_ok())
-}
-
-async fn release_postgres_lock(transaction: &DatabaseTransaction) -> Result<(), TableError> {
-    transaction
-        .execute_raw(Statement::from_string(
-            DbBackend::Postgres,
-            format!("SELECT pg_advisory_unlock({ADVISORY_LOCK_KEY})"),
-        ))
-        .await
-        .map_err(|source| TableError::MigrationFailed {
-            sql: "pg_advisory_unlock".to_string(),
-            source,
-        })?;
     Ok(())
-}
-
-async fn release_lock(
-    transaction: &DatabaseTransaction,
-    backend: DbBackend,
-) -> Result<(), TableError> {
-    match backend {
-        DbBackend::MySql => release_mysql_lock(transaction).await,
-        DbBackend::Postgres => release_postgres_lock(transaction).await,
-        // SQLite releases its write lock when the transaction ends
-        _ => Ok(()),
-    }
 }
 
 /// Runs a group of statements as one unit
@@ -555,12 +401,9 @@ async fn apply_in_transaction(
     db: &DatabaseConnection,
     statements: &[String],
 ) -> Result<(), TableError> {
-    // SQLite turns `PRAGMA foreign_keys` into a no-op inside a transaction, so
-    // it has to be toggled around the transaction rather than within it.
-    let is_sqlite = db.get_database_backend() == DbBackend::Sqlite;
-    if is_sqlite {
-        execute(db, "PRAGMA foreign_keys = OFF").await?;
-    }
+    let backend = AnyBackend::for_connection(db)?;
+
+    run_outside(db, backend.before_statements()).await?;
 
     let transaction = db.begin().await.map_err(|source| TableError::MigrationFailed {
         sql: "BEGIN".to_string(),
@@ -589,546 +432,23 @@ async fn apply_in_transaction(
             }),
     };
 
-    if is_sqlite {
-        execute(db, "PRAGMA foreign_keys = ON").await?;
-    }
+    run_outside(db, backend.after_statements()).await?;
 
     outcome
 }
 
-/// Rewrites a parsed structure so it compares equal to what the reader reports
-///
-/// SQLite stores types loosely, so the declared spelling on both sides is
-/// reduced to a type affinity before they are compared.
-fn normalize_expected(mut schema: crate::schema::TableSchema, backend: DbBackend) -> crate::schema::TableSchema {
-    if backend == DbBackend::Sqlite {
-        for column in &mut schema.columns {
-            column.col_type = sqlite_type_affinity(&column.col_type);
-        }
-    }
-    schema
-}
-
-// ---------------------------------------------------------------------------
-// MySQL
-// ---------------------------------------------------------------------------
-
-/// Builds the MySQL statements for a diff
-///
-/// The order is deliberate:
-///
-/// 1. drop indexes, so nothing still points at a column that is about to change
-/// 2. drop columns
-/// 3. add columns
-/// 4. modify columns
-/// 5. add indexes, so they are built on the final column definitions
-fn mysql_statements(diff: &TableDiff) -> Vec<String> {
-    let table = quote_mysql_identifier(&diff.table);
-    let mut statements = Vec::new();
-
-    for change in &diff.indexes {
-        if let IndexChange::Drop(index) = change {
-            statements.push(if index.primary {
-                format!("ALTER TABLE {table} DROP PRIMARY KEY")
-            } else {
-                format!(
-                    "ALTER TABLE {table} DROP INDEX {}",
-                    quote_mysql_identifier(&index.name)
-                )
-            });
-        }
-    }
-
-    for change in &diff.columns {
-        if let ColumnChange::Drop { name } = change {
-            statements.push(format!(
-                "ALTER TABLE {table} DROP COLUMN {}",
-                quote_mysql_identifier(name)
-            ));
-        }
-    }
-
-    for change in &diff.columns {
-        if let ColumnChange::Add(column) = change {
-            statements.push(format!(
-                "ALTER TABLE {table} ADD COLUMN {}",
-                mysql_column_definition(column)
-            ));
-        }
-    }
-
-    for change in &diff.columns {
-        if let ColumnChange::Alter { to, .. } = change {
-            statements.push(format!(
-                "ALTER TABLE {table} MODIFY COLUMN {}",
-                mysql_column_definition(to)
-            ));
-        }
-    }
-
-    for change in &diff.indexes {
-        if let IndexChange::Add(index) = change {
-            statements.push(mysql_add_index(&table, index));
-        }
-    }
-
-    statements
-}
-
-/// Renders a column as it appears inside an `ALTER TABLE` statement
-///
-/// The type is emitted verbatim: it already comes from the statement sea-query
-/// generated for this same backend, so it needs no translation.
-fn mysql_column_definition(column: &ColumnSchema) -> String {
-    let mut definition = format!(
-        "{} {}",
-        quote_mysql_identifier(&column.name),
-        column.col_type
-    );
-
-    if !column.nullable {
-        definition.push_str(" NOT NULL");
-    }
-    if let Some(default) = &column.default {
-        definition.push_str(&format!(" DEFAULT {}", quote_mysql_literal(default)));
-    }
-    if column.auto_increment {
-        definition.push_str(" AUTO_INCREMENT");
-    }
-
-    definition
-}
-
-fn mysql_add_index(table: &str, index: &IndexSchema) -> String {
-    let columns = index
-        .columns
-        .iter()
-        .map(|column| quote_mysql_identifier(column))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    if index.primary {
-        format!("ALTER TABLE {table} ADD PRIMARY KEY ({columns})")
-    } else if index.unique {
-        format!(
-            "ALTER TABLE {table} ADD UNIQUE INDEX {} ({columns})",
-            quote_mysql_identifier(&index.name)
-        )
-    } else {
-        format!(
-            "ALTER TABLE {table} ADD INDEX {} ({columns})",
-            quote_mysql_identifier(&index.name)
-        )
-    }
-}
-
-/// Quotes an identifier with backticks, MySQL style
-fn quote_mysql_identifier(name: &str) -> String {
-    format!("`{}`", name.replace('`', "``"))
-}
-
-/// Quotes a literal, escaping the quotes it contains
-fn quote_mysql_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-// ---------------------------------------------------------------------------
-// SQLite
-// ---------------------------------------------------------------------------
-
-/// Suffix used for the replacement table while a table is being rebuilt
-const REBUILD_SUFFIX: &str = "__auto_table_rebuild";
-
-/// Whether SQLite can express this diff with plain `ALTER TABLE` statements
-///
-/// SQLite can add and drop columns, but it cannot touch a column definition —
-/// there is no `MODIFY COLUMN` and no `ALTER COLUMN`. Anything else has to go
-/// through a table rebuild, and that includes **every** index change: a unique
-/// constraint is part of the table definition, and the index backing it cannot
-/// be dropped on its own at all.
-fn sqlite_needs_rebuild(diff: &TableDiff) -> bool {
-    let changes_a_column = diff
-        .columns
-        .iter()
-        .any(|change| matches!(change, ColumnChange::Alter { .. }));
-
-    changes_a_column || !diff.indexes.is_empty()
-}
-
-/// Builds the SQLite statements for a diff that needs no table rebuild
-fn sqlite_simple_alters(diff: &TableDiff) -> Vec<String> {
-    let table = quote_sqlite_identifier(&diff.table);
-    let mut statements = Vec::new();
-
-    for change in &diff.indexes {
-        if let IndexChange::Drop(index) = change {
-            statements.push(format!(
-                "DROP INDEX {}",
-                quote_sqlite_identifier(&index.name)
-            ));
-        }
-    }
-
-    for change in &diff.columns {
-        if let ColumnChange::Drop { name } = change {
-            statements.push(format!(
-                "ALTER TABLE {table} DROP COLUMN {}",
-                quote_sqlite_identifier(name)
-            ));
-        }
-    }
-
-    for change in &diff.columns {
-        if let ColumnChange::Add(column) = change {
-            statements.push(format!(
-                "ALTER TABLE {table} ADD COLUMN {}",
-                sqlite_column_definition(column)
-            ));
-        }
-    }
-
-    for change in &diff.indexes {
-        if let IndexChange::Add(index) = change {
-            // A primary key can only be created with the table, so reaching
-            // here with one means the caller should have rebuilt instead.
-            if !index.primary {
-                statements.push(sqlite_create_index(&diff.table, index));
-            }
-        }
-    }
-
-    statements
-}
-
-/// Builds the statements that rebuild a table with the structure the entity declares
-///
-/// A rebuild is the only way to change a column definition on SQLite. It creates
-/// the new table from the entity's own `CREATE TABLE`, copies over the rows, then
-/// swaps the tables. The caller must run these statements inside a transaction.
-fn sqlite_rebuild(diff: &TableDiff, create_sql: &str) -> Result<Vec<String>, TableError> {
-    if create_sql.trim().is_empty() {
-        return Err(TableError::MissingCreateStatement {
-            table: diff.table.clone(),
-        });
-    }
-
-    let target = parse_create_table(create_sql).map_err(|source| TableError::ParseExpectedFailed {
-        table: diff.table.clone(),
-        source,
-    })?;
-
-    let table = quote_sqlite_identifier(&diff.table);
-    let replacement_name = format!("{}{}", diff.table, REBUILD_SUFFIX);
-    let replacement = quote_sqlite_identifier(&replacement_name);
-
-    let mut statements = vec![retarget_create_table(create_sql, &diff.table, &replacement_name)];
-
-    if let Some(insert) = sqlite_copy_rows(&target, &replacement, &table, diff) {
-        statements.push(insert);
-    }
-
-    statements.push(format!("DROP TABLE {table}"));
-    statements.push(format!("ALTER TABLE {replacement} RENAME TO {table}"));
-
-    // Indexes die with the old table and have to be created again. The primary
-    // key and inline unique constraints are already part of the new definition.
-    for change in &diff.indexes {
-        if let IndexChange::Add(index) = change {
-            if !index.primary {
-                // The replacement table has already been renamed back, so the
-                // index is created against the original table name.
-                statements.push(sqlite_create_index(&diff.table, index));
-            }
-        }
-    }
-
-    Ok(statements)
-}
-
-/// Builds the `INSERT INTO ... SELECT` that carries rows into the new table
-///
-/// Only the columns present on both sides can be copied; columns that the entity
-/// no longer declares are simply left behind.
-fn sqlite_copy_rows(
-    target: &crate::schema::TableSchema,
-    replacement: &str,
-    table: &str,
-    diff: &TableDiff,
-) -> Option<String> {
-    let added: Vec<&str> = diff
-        .columns
-        .iter()
-        .filter_map(|change| match change {
-            ColumnChange::Add(column) => Some(column.name.as_str()),
-            _ => None,
-        })
-        .collect();
-
-    let dropped: Vec<&str> = diff
-        .columns
-        .iter()
-        .filter_map(|change| match change {
-            ColumnChange::Drop { name } => Some(name.as_str()),
-            _ => None,
-        })
-        .collect();
-
-    // The old table had every column the new one declares except the added
-    // ones, plus the columns that are about to be dropped.
-    let mut old_columns: Vec<&str> = target
-        .columns
-        .iter()
-        .filter(|column| !added.contains(&column.name.as_str()))
-        .map(|column| column.name.as_str())
-        .collect();
-    old_columns.extend(dropped.iter().copied());
-
-    let shared: Vec<&str> = target
-        .columns
-        .iter()
-        .map(|column| column.name.as_str())
-        .filter(|name| old_columns.contains(name))
-        .collect();
-
-    if shared.is_empty() {
-        return None;
-    }
-
-    let columns = shared
-        .iter()
-        .map(|name| quote_sqlite_identifier(name))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    Some(format!(
-        "INSERT INTO {replacement} ({columns}) SELECT {columns} FROM {table}"
-    ))
-}
-
-/// Rewrites a `CREATE TABLE` statement to build the table under another name
-fn retarget_create_table(sql: &str, table: &str, replacement: &str) -> String {
-    let old = quote_sqlite_identifier(table);
-    let new = quote_sqlite_identifier(replacement);
-
-    // Only the table name right after CREATE TABLE may be replaced; the same
-    // spelling cannot legitimately appear anywhere else in the statement.
-    match sql.find(&old) {
-        Some(position) => format!("{}{}{}", &sql[..position], new, &sql[position + old.len()..]),
-        None => sql.to_string(),
-    }
-}
-
-fn sqlite_column_definition(column: &ColumnSchema) -> String {
-    let mut definition = format!(
-        "{} {}",
-        quote_sqlite_identifier(&column.name),
-        column.col_type
-    );
-
-    if !column.nullable {
-        definition.push_str(" NOT NULL");
-    }
-    if let Some(default) = &column.default {
-        definition.push_str(&format!(" DEFAULT {}", quote_sqlite_literal(default)));
-    }
-
-    definition
-}
-
-fn sqlite_create_index(table: &str, index: &IndexSchema) -> String {
-    let name = quote_sqlite_identifier(&index.name);
-    let target = quote_sqlite_identifier(table);
-    let columns = index
-        .columns
-        .iter()
-        .map(|column| quote_sqlite_identifier(column))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    if index.unique {
-        format!("CREATE UNIQUE INDEX {name} ON {target} ({columns})")
-    } else {
-        format!("CREATE INDEX {name} ON {target} ({columns})")
-    }
-}
-
-/// Quotes an identifier, SQLite style
-fn quote_sqlite_identifier(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
-
-fn quote_sqlite_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
 
 // ---------------------------------------------------------------------------
 // PostgreSQL
 // ---------------------------------------------------------------------------
 
-/// Builds the PostgreSQL statements for a diff
-///
-/// The order follows the MySQL one — drop indexes, drop columns, add columns,
-/// change columns, add indexes — but two things differ:
-///
-/// - A column change is **one clause per aspect** rather than a single
-///   `MODIFY COLUMN`: type, nullability, default and identity each get their own
-///   `ALTER COLUMN` statement.
-/// - Indexes backed by a constraint are added and dropped as constraints.
-///   PostgreSQL refuses to drop such an index with `DROP INDEX`, because the
-///   constraint depends on it.
-fn postgres_statements(diff: &TableDiff) -> Vec<String> {
-    let table = quote_postgres_identifier(&diff.table);
-    let mut statements = Vec::new();
-
-    for change in &diff.indexes {
-        if let IndexChange::Drop(index) = change {
-            statements.push(postgres_drop_index(&diff.table, index));
-        }
-    }
-
-    for change in &diff.columns {
-        if let ColumnChange::Drop { name } = change {
-            statements.push(format!(
-                "ALTER TABLE {table} DROP COLUMN {}",
-                quote_postgres_identifier(name)
-            ));
-        }
-    }
-
-    for change in &diff.columns {
-        if let ColumnChange::Add(column) = change {
-            statements.push(format!(
-                "ALTER TABLE {table} ADD COLUMN {}",
-                postgres_column_definition(column)
-            ));
-        }
-    }
-
-    for change in &diff.columns {
-        if let ColumnChange::Alter { name, aspects, .. } = change {
-            let column = quote_postgres_identifier(name);
-            for aspect in aspects {
-                statements.push(match aspect {
-                    ColumnAspect::Type { to, .. } => {
-                        format!("ALTER TABLE {table} ALTER COLUMN {column} TYPE {to}")
-                    }
-                    ColumnAspect::Nullable { to, .. } => {
-                        let action = if *to { "DROP" } else { "SET" };
-                        format!("ALTER TABLE {table} ALTER COLUMN {column} {action} NOT NULL")
-                    }
-                    ColumnAspect::Default { to, .. } => match to {
-                        Some(value) => format!(
-                            "ALTER TABLE {table} ALTER COLUMN {column} SET DEFAULT {}",
-                            quote_postgres_literal(value)
-                        ),
-                        None => {
-                            format!("ALTER TABLE {table} ALTER COLUMN {column} DROP DEFAULT")
-                        }
-                    },
-                    ColumnAspect::AutoIncrement { to, .. } => {
-                        let action = if *to { "ADD" } else { "DROP" };
-                        format!(
-                            "ALTER TABLE {table} ALTER COLUMN {column} {action} GENERATED BY DEFAULT AS IDENTITY"
-                        )
-                    }
-                });
-            }
-        }
-    }
-
-    for change in &diff.indexes {
-        if let IndexChange::Add(index) = change {
-            statements.push(postgres_add_index(&diff.table, index));
-        }
-    }
-
-    statements
-}
-
-fn postgres_column_definition(column: &ColumnSchema) -> String {
-    let mut definition = format!(
-        "{} {}",
-        quote_postgres_identifier(&column.name),
-        column.col_type
-    );
-
-    if !column.nullable {
-        definition.push_str(" NOT NULL");
-    }
-    if let Some(default) = &column.default {
-        definition.push_str(&format!(
-            " DEFAULT {}",
-            quote_postgres_literal(default)
-        ));
-    }
-
-    definition
-}
-
-fn postgres_add_index(table_name: &str, index: &IndexSchema) -> String {
-    let table = quote_postgres_identifier(table_name);
-    let columns = postgres_column_list(&index.columns);
-
-    if index.primary {
-        format!("ALTER TABLE {table} ADD PRIMARY KEY ({columns})")
-    } else if index.unique {
-        let constraint = quote_postgres_identifier(&postgres_unique_constraint_name(
-            table_name,
-            &index.columns,
-        ));
-        format!("ALTER TABLE {table} ADD CONSTRAINT {constraint} UNIQUE ({columns})")
-    } else {
-        let name = quote_postgres_identifier(&index.name);
-        format!("CREATE INDEX {name} ON {table} ({columns})")
-    }
-}
-
-fn postgres_drop_index(table_name: &str, index: &IndexSchema) -> String {
-    let table = quote_postgres_identifier(table_name);
-
-    if index.primary {
-        // PostgreSQL names the primary key constraint <table>_pkey
-        let constraint = quote_postgres_identifier(&format!("{table_name}_pkey"));
-        format!("ALTER TABLE {table} DROP CONSTRAINT {constraint}")
-    } else if index.unique {
-        let constraint = quote_postgres_identifier(&postgres_unique_constraint_name(
-            table_name,
-            &index.columns,
-        ));
-        format!("ALTER TABLE {table} DROP CONSTRAINT {constraint}")
-    } else {
-        // A plain index, with no constraint behind it
-        format!("DROP INDEX {}", quote_postgres_identifier(&index.name))
-    }
-}
-
-/// The name PostgreSQL gives a unique constraint: `<table>_<columns>_key`
-fn postgres_unique_constraint_name(table_name: &str, columns: &[String]) -> String {
-    format!("{table_name}_{}_key", columns.join("_"))
-}
-
-fn postgres_column_list(columns: &[String]) -> String {
-    columns
-        .iter()
-        .map(|column| quote_postgres_identifier(column))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// Quotes an identifier, PostgreSQL style
-fn quote_postgres_identifier(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
-
-fn quote_postgres_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff::ColumnAspect;
+    use crate::backend::sqlite::*;
+    use crate::diff::{ColumnAspect, ColumnChange, IndexChange};
     use crate::parse::PRIMARY_INDEX_NAME;
+    use crate::schema::{ColumnSchema, IndexSchema};
 
     fn column(name: &str, col_type: &str) -> ColumnSchema {
         ColumnSchema {

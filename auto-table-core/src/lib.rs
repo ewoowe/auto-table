@@ -19,13 +19,15 @@ compile_error!(
 );
 
 use sea_orm::sea_query::TableCreateStatement;
-use sea_orm::{DatabaseConnection, DbBackend};
+use sea_orm::{DatabaseConnection, DatabaseTransaction, DbBackend};
 
+pub mod backend;
 pub mod diff;
 pub mod migrate;
 pub mod parse;
 pub mod schema;
 
+pub use backend::{backend_for, AnyBackend};
 pub use diff::{
     diff_table, ColumnAspect, ColumnChange, IndexChange, TableDiff,
 };
@@ -229,3 +231,74 @@ pub async fn create_missing_tables(
 // `auto_table_core` crate to use both `#[auto_table]` and `#[auto_create]`
 // (no separate dependency on `auto_table_derive` required).
 pub use auto_table_derive::{auto_create, auto_table};
+
+/// Everything a database backend has to provide
+///
+/// The rest of the migration machinery only talks to a backend through this
+/// trait, so supporting another database means implementing it and nothing
+/// else: reading and diffing structures, planning statements and executing them
+/// stay untouched.
+///
+/// Each backend lives in its own module under [`backend`], named after the
+/// database it implements.
+// The async methods are reached through `AnyBackend`, a concrete enum,
+// rather than through a trait object, so auto trait bounds do not apply.
+#[allow(async_fn_in_trait)]
+pub trait Backend: Send + Sync {
+    /// Reads the current structure of one table
+    ///
+    /// Both the columns and the indexes are reported in a normalized form, so
+    /// that they can be compared with the structure parsed out of the entity's
+    /// `CREATE TABLE` (see [`Backend::normalize_expected`]).
+    async fn read_table(
+        &self,
+        db: &DatabaseConnection,
+        table: &str,
+    ) -> Result<TableSchema, TableError>;
+
+    /// Rewrites a parsed structure so it compares equal to what
+    /// [`Backend::read_table`] reports
+    ///
+    /// The default does nothing, which suits most backends: they compare types
+    /// by their declared spelling, which is already what the entity's
+    /// `CREATE TABLE` produces. SQLite overrides it, because there types are
+    /// compared by affinity instead.
+    fn normalize_expected(&self, _schema: &mut TableSchema) {}
+
+    /// Turns the changes of one table into the statements that apply them
+    ///
+    /// `create_sql` is the `CREATE TABLE` the entity declares. Most backends
+    /// ignore it; SQLite needs it, because changing a column definition there
+    /// means rebuilding the table.
+    fn plan(&self, diff: &TableDiff, create_sql: &str) -> Result<TableMigration, TableError>;
+
+    /// Takes the migration lock, reporting whether it was obtained
+    ///
+    /// It is taken on the transaction that runs the migration, because both
+    /// MySQL's `GET_LOCK` and PostgreSQL's advisory locks are session scoped:
+    /// on any other connection they would guard nothing.
+    async fn acquire_lock(
+        &self,
+        transaction: &DatabaseTransaction,
+        timeout_secs: u32,
+    ) -> Result<bool, TableError>;
+
+    /// Releases the migration lock
+    async fn release_lock(
+        &self,
+        transaction: &DatabaseTransaction,
+    ) -> Result<(), TableError>;
+
+    /// Statements to run before the migration, outside any transaction
+    ///
+    /// SQLite needs this: `PRAGMA foreign_keys` is silently ignored inside a
+    /// transaction.
+    fn before_statements(&self) -> &[&str] {
+        &[]
+    }
+
+    /// Statements to run after the migration, outside any transaction
+    fn after_statements(&self) -> &[&str] {
+        &[]
+    }
+}

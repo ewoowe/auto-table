@@ -423,7 +423,8 @@ mod round_trip {
 
     use crate::diff::{diff_table, ColumnChange};
     use crate::parse::parse_create_table;
-    use crate::schema::{normalize_mysql_type, ColumnSchema, IndexSchema, TableSchema};
+    use crate::backend::mysql::normalize_mysql_type;
+    use crate::schema::{ColumnSchema, IndexSchema, TableSchema};
 
     #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
     #[sea_orm(table_name = "round_trip")]
